@@ -1,0 +1,18 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Logs and temp
+*.log
+_*.py
+_*.js
+_*.json
+
+# Dependencies (none currently, but keep the door shut)
+node_modules/
