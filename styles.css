@@ -636,22 +636,40 @@ kbd {
 }
 @keyframes blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }
 
-.thinking { display: inline-flex; align-items: center; gap: 8px; padding: 3px 0; }
+/* ---- Thinking: Claude-style asterisk loader ---- */
 
-.thinking-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: thinkPulse 1.5s ease-in-out infinite;
+.thinking { display: inline-flex; align-items: center; gap: 10px; padding: 2px 0; }
+
+.think-star {
+  width: 22px; height: 22px;
+  color: var(--accent);
+  overflow: visible;
 }
-@keyframes thinkPulse {
-  0%, 100% { transform: scale(.65); opacity: .4; }
-  50%      { transform: scale(1);   opacity: 1; }
+.think-star g {
+  transform-origin: 12px 12px;
+  animation: starTurn 3.6s linear infinite;
+}
+.think-star line {
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  transform-origin: 12px 12px;
+  animation: starRay 1.5s ease-in-out infinite;
+}
+.think-star line:nth-child(1) { animation-delay: 0s; }
+.think-star line:nth-child(2) { animation-delay: .19s; }
+.think-star line:nth-child(3) { animation-delay: .38s; }
+.think-star line:nth-child(4) { animation-delay: .57s; }
+
+@keyframes starTurn { to { transform: rotate(360deg); } }
+@keyframes starRay {
+  0%, 100% { opacity: .28; transform: scale(.5); }
+  45%      { opacity: 1;   transform: scale(1); }
 }
 
-/* A highlight sweeping left to right across the word, like Claude's */
+/* A highlight sweeping across the word, alongside the star */
 .thinking-text {
-  font-size: 13px;
+  font-size: 13.5px;
   background: linear-gradient(90deg,
     var(--text-faint) 30%, var(--text) 50%, var(--text-faint) 70%);
   background-size: 250% 100%;
@@ -668,7 +686,129 @@ kbd {
 
 @media (prefers-reduced-motion: reduce) {
   .thinking-text { -webkit-text-fill-color: var(--text-dim); color: var(--text-dim); }
+  .think-star g { animation: none; }
 }
+
+/* ============================================================
+   Clarifying question card
+   ============================================================ */
+
+.ask-card {
+  margin-top: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+
+.ask-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 12px 13px 16px;
+}
+.ask-q { flex: 1; min-width: 0; font-size: 13.5px; font-weight: 600; line-height: 1.45; }
+
+.ask-nav { display: flex; align-items: center; gap: 2px; flex: none; }
+.ask-count { font-size: 11.5px; color: var(--text-faint); margin-right: 4px; white-space: nowrap; }
+
+.ask-nav-btn {
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  transition: background .1s, color .1s;
+}
+.ask-nav-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.ask-nav-btn:disabled { opacity: .3; cursor: default; }
+.ask-nav-btn svg { width: 14px; height: 14px; }
+
+.ask-options { display: flex; flex-direction: column; }
+
+.ask-opt {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 11px 14px;
+  text-align: left;
+  border-top: 1px solid var(--line);
+  transition: background .1s;
+}
+.ask-opt:hover { background: var(--bg-hover); }
+.ask-opt.on { background: var(--accent-soft); }
+
+.ask-num {
+  width: 22px; height: 22px;
+  flex: none;
+  display: grid; place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--bg-active);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.ask-opt:hover .ask-num,
+.ask-opt.on .ask-num { background: var(--accent); color: var(--accent-ink); }
+.ask-num.pencil { background: transparent; }
+.ask-num svg { width: 13px; height: 13px; }
+
+.ask-text { flex: 1; min-width: 0; font-size: 13.5px; line-height: 1.45; }
+.ask-text b { font-weight: 500; }
+.ask-text em { font-style: normal; color: var(--text-faint); }
+
+.ask-tick { color: transparent; font-size: 12px; flex: none; }
+.ask-opt.on .ask-tick { color: var(--accent); }
+
+.ask-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px 9px 14px;
+  border-top: 1px solid var(--line);
+}
+.ask-other {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: 0;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.ask-other:focus { outline: none; }
+.ask-other::placeholder { color: var(--text-faint); }
+
+.ask-send, .ask-skip {
+  flex: none;
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background .1s, color .1s;
+}
+.ask-send { background: var(--accent); color: var(--accent-ink); }
+.ask-send:hover { background: var(--accent-hover); }
+.ask-skip { background: var(--bg-active); color: var(--text-dim); }
+.ask-skip:hover { color: var(--text); }
+
+/* What you answered, once the card is gone */
+.ask-answered {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elev);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+
+@media (max-width: 620px) {
+  .ask-head { padding: 12px; }
+  .ask-opt { padding: 12px; }
+  .ask-count { display: none; }
+}
+
 
 .msg-tools { display: flex; margin-top: 10px; margin-left: -7px; opacity: 0; transition: opacity .1s; }
 .msg.user .msg-tools { margin-left: 0; margin-right: -7px; }

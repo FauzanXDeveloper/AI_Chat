@@ -59,6 +59,7 @@ const DEFAULTS = {
   enterSends: true,
   sidebarCollapsed: false,
   sidebarW: 260,
+  allowAsk: true,
   defaultAgentId: 'general',
 };
 
@@ -281,6 +282,21 @@ function toast(message, kind = '', ms = 3200) {
 /* ------------------------------------------------------------
  * Markdown
  * ---------------------------------------------------------- */
+
+/* Claude-style asterisk loader: rays pulse in sequence while the whole
+   figure turns, so it reads as thought rather than as a spinner. */
+const THINKING_HTML =
+  '<div class="thinking" role="status" aria-label="Thinking">' +
+    '<svg class="think-star" viewBox="0 0 24 24" aria-hidden="true">' +
+      '<g>' +
+        '<line x1="12" y1="2.5" x2="12" y2="21.5"/>' +
+        '<line x1="2.5" y1="12" x2="21.5" y2="12"/>' +
+        '<line x1="5.3" y1="5.3" x2="18.7" y2="18.7"/>' +
+        '<line x1="18.7" y1="5.3" x2="5.3" y2="18.7"/>' +
+      '</g>' +
+    '</svg>' +
+    '<span class="thinking-text">Thinking' + '…' + '</span>' +
+  '</div>';
 
 const COPY_SVG = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>';
 
@@ -544,6 +560,8 @@ function messageHTML(msg, chat) {
 
   const modelName = modelById(msg.model)?.name || msg.model || chat.model;
   const agent = agentById(chat.agentId);
+  const ask = msg.pending ? { text: '', spec: null } : extractAsk(text);
+  const showCard = ask.spec && !msg.askAnswered && !msg.askDismissed;
   const stats = [];
   if (msg.tokens)  stats.push(`${fmtNum(msg.tokens)} tok`);
   if (msg.elapsed) stats.push(`${(msg.elapsed / 1000).toFixed(1)}s`);
@@ -556,7 +574,9 @@ function messageHTML(msg, chat) {
         <span class="sep">&middot;</span>
         <span class="msg-model">${escapeHtml(modelName)}</span>
       </div>
-      <div class="bubble md" data-body>${msg.pending ? '<div class="thinking"><span class="thinking-dot"></span><span class="thinking-text">Thinking…</span></div>' : renderMarkdown(text)}</div>
+      <div class="bubble md" data-body>${msg.pending ? THINKING_HTML : renderMarkdown(ask.text)}</div>
+      ${showCard ? askCardHTML(msg, ask.spec) : ''}
+      ${msg.askAnswered ? `<div class="ask-answered">${escapeHtml(msg.askAnswered.replace(/\*\*/g, ''))}</div>` : ''}
       <div class="msg-tools">
         <button class="tool-btn" data-action="copy-msg" data-id="${msg.id}">${COPY_SVG}Copy</button>
         <button class="tool-btn" data-action="regen" data-id="${msg.id}">
@@ -619,6 +639,9 @@ function systemPromptFor(chat) {
 function buildPayloadMessages(chat) {
   const out = [];
   let sys = (systemPromptFor(chat) || '').trim();
+  if (state.settings.allowAsk) sys = `${sys}
+
+${ASK_PROTOCOL}`.trim();
   if (state.wsContext) sys = `${sys}
 
 ${state.wsContext}`.trim();
@@ -715,7 +738,7 @@ async function runCompletion(chat, assistantMsg) {
         const target = node();
         if (!target) return;
         target.classList.add('md');
-        target.innerHTML = renderMarkdown(acc);
+        target.innerHTML = renderMarkdown(stripPartialAsk(acc));
         target.classList.toggle('streaming', !finalPass);
         scrollToBottom();
       };
@@ -1025,6 +1048,7 @@ function syncSettingsForm() {
   }
 
   $('#streamInput').checked = s.stream;
+  $('#askInput').checked = s.allowAsk;
   $('#autoScrollInput').checked = s.autoScroll;
   $('#enterSendsInput').checked = s.enterSends;
 
@@ -1201,7 +1225,7 @@ el.messages.addEventListener('click', async (e) => {
     }
 
     case 'copy-msg': {
-      const ok = await copyText(textOf(chat.messages[index]));
+      const ok = await copyText(visibleText(chat.messages[index]));
       toast(ok ? 'Copied to clipboard' : 'Could not access the clipboard', ok ? 'ok' : 'err', 1600);
       break;
     }
@@ -1228,7 +1252,7 @@ el.messages.addEventListener('click', async (e) => {
 
     case 'export-msg': {
       if (index < 0) break;
-      openExportMenu(btn, textOf(chat.messages[index]), chat.title);
+      openExportMenu(btn, visibleText(chat.messages[index]), chat.title);
       break;
     }
 
@@ -1508,7 +1532,8 @@ for (const [sel, key, out, fmt, cast] of sliders) {
   });
 }
 
-const switches = [['#streamInput', 'stream'], ['#autoScrollInput', 'autoScroll'], ['#enterSendsInput', 'enterSends']];
+const switches = [['#streamInput', 'stream'], ['#autoScrollInput', 'autoScroll'],
+                  ['#enterSendsInput', 'enterSends'], ['#askInput', 'allowAsk']];
 for (const [sel, key] of switches) {
   $(sel).addEventListener('change', (e) => {
     state.settings[key] = e.target.checked;
@@ -2723,6 +2748,274 @@ $('#fileTree').addEventListener('click', (e) => {
 $('#applyPatchBtn').addEventListener('click', applyPatch);
 
 renderTree();
+
+/* ============================================================
+ * Clarifying questions
+ *
+ * The model asks by emitting a fenced ```ask block holding JSON.
+ * We lift that block out of the rendered Markdown and draw it as a
+ * real control, so the reply reads as a question rather than as a
+ * wall of JSON.
+ * ---------------------------------------------------------- */
+
+const ASK_FENCE = /```(?:ask|ASK)[ \t]*\r?\n([\s\S]*?)```/;
+const ASK_PARTIAL = /```(?:ask|ASK)[\s\S]*$/;   // still streaming, no closing fence yet
+
+const ASK_PROTOCOL = [
+  'If a request is ambiguous enough that different readings would lead to materially',
+  'different work, ask before answering. To ask, reply with ONLY a fenced block tagged',
+  '`ask` containing JSON of this shape:',
+  '',
+  '```ask',
+  '{"questions":[{"question":"...","options":[{"label":"Short label","description":"What it means"}],"multiSelect":false}]}',
+  '```',
+  '',
+  'Rules: at most 3 questions, each with 2-4 options. Keep labels under 6 words.',
+  'Put no prose outside the block. Use this sparingly — when the answer is obvious,',
+  'or the user has already told you, just answer.',
+].join('\n');
+
+/** Validate loosely: a malformed card must never break the message. */
+function normalizeAsk(raw) {
+  if (!raw || !Array.isArray(raw.questions) || !raw.questions.length) return null;
+
+  const questions = raw.questions.slice(0, 3).map((q) => ({
+    question: String(q?.question || '').slice(0, 300),
+    multiSelect: !!q?.multiSelect,
+    options: (Array.isArray(q?.options) ? q.options : []).slice(0, 6).map((o) => ({
+      label: String(o?.label ?? o ?? '').slice(0, 120),
+      description: String(o?.description || '').slice(0, 200),
+    })).filter((o) => o.label),
+  })).filter((q) => q.question && q.options.length);
+
+  return questions.length ? { questions } : null;
+}
+
+/** Split a reply into the prose to render and the question spec, if any. */
+function extractAsk(text) {
+  const m = (text || '').match(ASK_FENCE);
+  if (!m) return { text: text || '', spec: null };
+
+  let spec = null;
+  try { spec = normalizeAsk(JSON.parse(m[1])); } catch { spec = null; }
+
+  // A block we could not parse stays visible, so nothing is silently swallowed.
+  if (!spec) return { text: text || '', spec: null };
+  return { text: (text || '').replace(ASK_FENCE, '').trim(), spec };
+}
+
+/** Hide a half-arrived ask block while the reply is still streaming. */
+const stripPartialAsk = (text) => (text || '').replace(ASK_PARTIAL, '').trimEnd();
+
+/** The text a user should get when copying or exporting a reply. */
+const visibleText = (msg) => extractAsk(textOf(msg)).text;
+
+/* ---- Card state, keyed by message id ---- */
+
+const askUI = new Map();   // id -> { page, answers: [] }
+
+const askStateFor = (id, spec) => {
+  if (!askUI.has(id)) askUI.set(id, { page: 0, answers: spec.questions.map(() => null) });
+  return askUI.get(id);
+};
+
+function askCardHTML(msg, spec) {
+  const st = askStateFor(msg.id, spec);
+  const total = spec.questions.length;
+  const page = Math.max(0, Math.min(st.page, total - 1));
+  const q = spec.questions[page];
+  const chosen = st.answers[page];
+  const picked = new Set(Array.isArray(chosen) ? chosen : chosen != null ? [chosen] : []);
+
+  const nav = total > 1
+    ? `<span class="ask-count">${page + 1} of ${total}</span>
+       <button class="ask-nav-btn" data-ask="prev" data-id="${msg.id}" ${page === 0 ? 'disabled' : ''} aria-label="Previous question">
+         <svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
+       </button>
+       <button class="ask-nav-btn" data-ask="next" data-id="${msg.id}" ${page === total - 1 ? 'disabled' : ''} aria-label="Next question">
+         <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+       </button>`
+    : '';
+
+  const options = q.options.map((o, i) => `
+    <button class="ask-opt ${picked.has(i) ? 'on' : ''}" data-ask="pick" data-id="${msg.id}" data-i="${i}">
+      <span class="ask-num">${i + 1}</span>
+      <span class="ask-text">
+        <b>${escapeHtml(o.label)}</b>${o.description ? `<em> &mdash; ${escapeHtml(o.description)}</em>` : ''}
+      </span>
+      ${q.multiSelect ? '<span class="ask-tick">&#10003;</span>' : ''}
+    </button>`).join('');
+
+  return `
+    <div class="ask-card" data-ask-card="${msg.id}">
+      <div class="ask-head">
+        <span class="ask-q">${escapeHtml(q.question)}</span>
+        <div class="ask-nav">
+          ${nav}
+          <button class="ask-nav-btn" data-ask="dismiss" data-id="${msg.id}" aria-label="Dismiss">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="ask-options">${options}</div>
+
+      <div class="ask-foot">
+        <span class="ask-num pencil">
+          <svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
+        </span>
+        <input type="text" class="ask-other" data-id="${msg.id}" placeholder="Something else&hellip;" autocomplete="off" />
+        ${q.multiSelect || picked.size ? `<button class="ask-send" data-ask="submit" data-id="${msg.id}">Send</button>` : ''}
+        <button class="ask-skip" data-ask="skip" data-id="${msg.id}">Skip</button>
+      </div>
+    </div>`;
+}
+
+/** Turn the collected answers into the message we send back. */
+function askCompose(spec, answers) {
+  const lines = [];
+  spec.questions.forEach((q, i) => {
+    const a = answers[i];
+    if (a == null) return;
+
+    let value;
+    if (typeof a === 'string') value = a;                                  // free text
+    else if (Array.isArray(a)) value = a.map((i2) => q.options[i2]?.label).filter(Boolean).join(', ');
+    else value = q.options[a]?.label;
+
+    if (value) lines.push(`**${q.question}** ${value}`);
+  });
+
+  return lines.length ? lines.join('\n') : 'Skip the questions and use your best judgement.';
+}
+
+function askRerender(id) {
+  const chat = currentChat();
+  const msg = chat?.messages.find((m) => m.id === id);
+  if (msg) refreshMessage(id);
+}
+
+async function askSubmit(id) {
+  const chat = currentChat();
+  const msg = chat?.messages.find((m) => m.id === id);
+  if (!msg) return;
+
+  const { spec } = extractAsk(textOf(msg));
+  if (!spec) return;
+
+  const st = askStateFor(id, spec);
+  msg.askAnswered = askCompose(spec, st.answers);
+  askUI.delete(id);
+  saveChats();
+  refreshMessage(id);
+  await send(msg.askAnswered);
+}
+
+/** Record an answer and either advance to the next question or submit. */
+function askAnswer(id, value) {
+  const chat = currentChat();
+  const msg = chat?.messages.find((m) => m.id === id);
+  if (!msg) return;
+
+  const { spec } = extractAsk(textOf(msg));
+  if (!spec) return;
+
+  const st = askStateFor(id, spec);
+  const page = Math.max(0, Math.min(st.page, spec.questions.length - 1));
+  const q = spec.questions[page];
+
+  if (q.multiSelect && typeof value === 'number') {
+    const cur = Array.isArray(st.answers[page]) ? st.answers[page] : [];
+    st.answers[page] = cur.includes(value) ? cur.filter((x) => x !== value) : [...cur, value];
+    askRerender(id);
+    return;                       // multi-select waits for an explicit Send
+  }
+
+  st.answers[page] = value;
+
+  if (page < spec.questions.length - 1) {
+    st.page = page + 1;
+    askRerender(id);
+  } else {
+    askSubmit(id);
+  }
+}
+
+/* ---- Wiring ---- */
+
+el.messages.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-ask]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const chat = currentChat();
+  const msg = chat?.messages.find((m) => m.id === id);
+  if (!msg) return;
+
+  switch (btn.dataset.ask) {
+    case 'pick': {
+      const card = btn.closest('.ask-card');
+      const typed = card?.querySelector('.ask-other')?.value.trim();
+      // Anything typed wins over the option that was clicked.
+      askAnswer(id, typed || Number(btn.dataset.i));
+      break;
+    }
+
+    case 'prev':
+    case 'next': {
+      const { spec } = extractAsk(textOf(msg));
+      if (!spec) break;
+      const st = askStateFor(id, spec);
+      st.page = Math.max(0, Math.min(
+        st.page + (btn.dataset.ask === 'next' ? 1 : -1), spec.questions.length - 1));
+      askRerender(id);
+      break;
+    }
+
+    case 'skip': {
+      askAnswer(id, null);
+      break;
+    }
+
+    case 'submit': {
+      const card = btn.closest('.ask-card');
+      const typed = card?.querySelector('.ask-other')?.value.trim();
+      if (typed) askAnswer(id, typed);
+      else askSubmit(id);
+      break;
+    }
+
+    case 'dismiss': {
+      msg.askDismissed = true;
+      askUI.delete(id);
+      saveChats();
+      refreshMessage(id);
+      break;
+    }
+  }
+});
+
+/* Enter in the free-text field answers the current question. */
+el.messages.addEventListener('keydown', (e) => {
+  const input = e.target.closest('.ask-other');
+  if (!input || e.key !== 'Enter') return;
+  e.preventDefault();
+  const value = input.value.trim();
+  if (value) askAnswer(input.dataset.id, value);
+});
+
+/* Number keys pick an option while a card is on screen and nothing else has focus. */
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '')) return;
+  if (!/^[1-6]$/.test(e.key)) return;
+
+  const cards = $$('.ask-card');
+  const card = cards[cards.length - 1];
+  if (!card) return;
+
+  const opt = card.querySelectorAll('.ask-opt')[Number(e.key) - 1];
+  if (opt) { e.preventDefault(); opt.click(); }
+});
 
 try {
   boot();

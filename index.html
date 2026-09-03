@@ -18,7 +18,7 @@
 <link rel="icon" href="favicon.png" type="image/png" />
 
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/vs2015.min.css" id="hljsTheme" />
-<link rel="stylesheet" href="styles.css?v=8" />
+<link rel="stylesheet" href="styles.css?v=9" />
 </head>
 <body>
 
@@ -390,6 +390,12 @@
           <span class="switch"></span>
           <span><b>Stream responses</b><em>Show tokens as they arrive instead of waiting for the whole reply.</em></span>
         </label>
+
+        <label class="switch-field">
+          <input type="checkbox" id="askInput" checked />
+          <span class="switch"></span>
+          <span><b>Let the assistant ask you questions</b><em>When a request is ambiguous it can reply with a multiple-choice card instead of guessing. Costs about 120 extra prompt tokens per turn.</em></span>
+        </label>
       </section>
 
       <!-- APPEARANCE -->
@@ -534,6 +540,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>
