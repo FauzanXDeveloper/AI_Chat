@@ -1,0 +1,60 @@
+name: Deploy to GitHub Pages
+
+# The app is static — no build, no bundler — so the job is really just
+# "copy the repo onto Pages", minus the files that are not part of the site.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a newer push supersedes one still in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # enablement: true turns Pages on the first time this runs, so the
+      # repository settings do not have to be touched by hand.
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Stage the site
+        run: |
+          mkdir -p _site
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '_site/' \
+            --exclude '_color.py' \
+            ./ _site/
+          # Pages runs Jekyll unless told not to, which would drop any file
+          # or folder whose name starts with an underscore.
+          touch _site/.nojekyll
+          test -f _site/index.html
+          ls -la _site
+
+      - name: Upload the artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -6,7 +6,7 @@
  * fallback for when the network is unavailable.
  */
 
-const CACHE = 'alrajhi-ai-v2';
+const CACHE = 'alrajhi-ai-v5';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.json',
                './favicon.png', './alrajhi_logo.png'];
 

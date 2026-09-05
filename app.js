@@ -61,6 +61,12 @@ const DEFAULTS = {
   sidebarW: 260,
   allowAsk: true,
   defaultAgentId: 'general',
+  auto: false,                 // let the app choose the model
+  autoBudget: 1,               // dollars per day for auto mode
+  autoSpend: null,             // { day: 'YYYY-MM-DD', amount: 0 }
+  web: false,                  // route through OpenRouter's :online search
+  ide: false,                  // workspace layout: explorer | editor | chat
+  autoApply: false,            // write the reply's files without a review first
 };
 
 /* Touch devices get a soft keyboard whose Enter key should insert a newline. */
@@ -151,6 +157,7 @@ const state = {
   stick: true,        // follow new output only while the reader is at the bottom
   agents: readJSON(KEYS.agents, null) || DEFAULT_AGENTS.map((a) => ({ ...a })),
   deliverable: null,  // pending "give me a file" request
+  readRounds: 0,      // file requests already served for this exchange
   wsContext: '',      // workspace files attached to the current turn
   editingAgentId: null,
   usage: null,
@@ -183,6 +190,7 @@ function newChat(activate = true) {
 }
 
 function setCurrent(id) {
+  if (typeof closeArtifact === 'function') closeArtifact();
   state.currentId = id;
   localStorage.setItem(KEYS.current, id);
   renderChatList();
@@ -212,6 +220,9 @@ const el = {
   scrollRegion: $('#scrollRegion'),
   scrollDown:   $('#scrollDownBtn'),
   composer:     $('#composer'),
+  artifact:     $('#artifactPanel'),
+  artifactBody: $('#artifactBody'),
+  artifactTabs: $('#artifactTabs'),
   input:        $('#input'),
   sendBtn:      $('#sendBtn'),
   stopBtn:      $('#stopBtn'),
@@ -296,6 +307,7 @@ const THINKING_HTML =
       '</g>' +
     '</svg>' +
     '<span class="thinking-text">Thinking' + '…' + '</span>' +
+    '<span class="think-time"></span>' +
   '</div>';
 
 const COPY_SVG = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>';
@@ -440,17 +452,22 @@ function renderModelMenu() {
         </button>
         <div class="model-row-price">${priceLabel(m)}</div>
         <button class="fav-btn ${state.favs.includes(m.id) ? 'on' : ''}" data-action="fav-model"
-                data-model="${escapeHtml(m.id)}" title="Save this model" type="button">&#9733;</button>
+                data-model="${escapeHtml(m.id)}" title="Save this model" type="button"><svg viewBox="0 0 24 24"><path d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.6 9.7l5.8-.8z"/></svg></button>
       </div>`;
   }).join('');
 }
 
 function syncModelUI() {
+  if (typeof updateStatusBar === 'function') updateStatusBar();
   const chat = currentChat();
   const id = chat?.model || state.settings.model;
   const m = modelById(id);
-  el.modelLabel.textContent = m?.name || id;
-  el.modelBtn.title = id;
+  const auto = state.settings.auto ? 'Auto · ' : '';
+  el.modelLabel.textContent = `${auto}${m?.name || id}`;
+  el.modelBtn.title = state.settings.auto
+    ? `Auto mode picked ${id} — $${autoRemaining().toFixed(2)} of today's budget left`
+    : id;
+  el.modelBtn.classList.toggle('auto-on', !!state.settings.auto);
   el.modelDot.classList.toggle('live', !!state.apiKey);
 }
 
@@ -482,15 +499,13 @@ function renderChatList() {
     return;
   }
 
-  let html = '';
-  let lastGroup = '';
-  for (const c of [...list].sort((a, b) => b.updatedAt - a.updatedAt)) {
-    const g = groupLabel(c.updatedAt);
-    if (g !== lastGroup) { html += `<div class="chat-group-label">${g}</div>`; lastGroup = g; }
-    html += `
+  const row = (c) => `
       <div class="chat-item ${c.id === state.currentId ? 'active' : ''}" data-id="${c.id}">
         <button class="chat-item-title" data-action="open-chat" data-id="${c.id}" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</button>
         <div class="chat-item-actions">
+          <button class="icon-btn ${c.pinned ? 'on' : ''}" data-action="pin-chat" data-id="${c.id}" title="${c.pinned ? 'Unpin' : 'Pin to the top'}">
+            <svg viewBox="0 0 24 24"><path d="M15 3l6 6-3 1-4 4-1 5-6-6 5-1 4-4z"/><path d="M9 15l-5 6"/></svg>
+          </button>
           <button class="icon-btn" data-action="rename-chat" data-id="${c.id}" title="Rename">
             <svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
           </button>
@@ -499,8 +514,25 @@ function renderChatList() {
           </button>
         </div>
       </div>`;
+
+  const pinned = list.filter((c) => c.pinned).sort((a, b) => b.updatedAt - a.updatedAt);
+  const rest   = list.filter((c) => !c.pinned).sort((a, b) => b.updatedAt - a.updatedAt);
+
+  let html = '<div class="chat-group-label">Pinned</div>';
+  html += pinned.length
+    ? pinned.map(row).join('')
+    : '<div class="pin-hint">Pin a chat to keep it here</div>';
+
+  let lastGroup = '';
+  for (const c of rest) {
+    const g = groupLabel(c.updatedAt);
+    if (g !== lastGroup) { html += `<div class="chat-group-label">${g}</div>`; lastGroup = g; }
+    html += row(c);
   }
   el.chatList.innerHTML = html;
+
+  const count = $('#navChatCount');
+  if (count) count.textContent = state.chats.length || '';
 }
 
 /* ------------------------------------------------------------
@@ -521,9 +553,32 @@ function imagesOf(msg) {
   return msg.content.filter((p) => p.type === 'image_url').map((p) => p.image_url.url);
 }
 
+/** A turn that was nothing but a file request reads as a note, not an empty bubble. */
+function replyBodyHTML(msg, text) {
+  const body = stripToolTokens(text);
+  if (body.trim()) return renderMarkdown(body);
+
+  const asked = extractReadRequests(textOf(msg));
+  if (asked.length) {
+    return `<span class="req-note">Asked to read ${escapeHtml(asked.join(', '))}</span>`;
+  }
+  return renderMarkdown(body);
+}
+
 function messageHTML(msg, chat) {
   const text = textOf(msg);
   const imgs = imagesOf(msg);
+
+  if (msg.role === 'user' && msg.auto) {
+    // An attachment the app made on the model's behalf: a note, not a turn.
+    return `
+      <div class="msg auto" data-id="${msg.id}">
+        <span class="auto-chip">
+          <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5"/></svg>
+          Attached ${escapeHtml((msg.attached || []).join(', ') || 'files')} for the assistant
+        </span>
+      </div>`;
+  }
 
   if (msg.role === 'user') {
     return `
@@ -574,7 +629,8 @@ function messageHTML(msg, chat) {
         <span class="sep">&middot;</span>
         <span class="msg-model">${escapeHtml(modelName)}</span>
       </div>
-      <div class="bubble md" data-body>${msg.pending ? THINKING_HTML : renderMarkdown(ask.text)}</div>
+      <div class="bubble md" data-body>${msg.pending ? THINKING_HTML : replyBodyHTML(msg, ask.text)}</div>
+      ${msg.pending ? '' : artifactChipHTML(msg)}
       ${showCard ? askCardHTML(msg, ask.spec) : ''}
       ${msg.askAnswered ? `<div class="ask-answered">${escapeHtml(msg.askAnswered.replace(/\*\*/g, ''))}</div>` : ''}
       <div class="msg-tools">
@@ -602,6 +658,7 @@ function renderMessages() {
   el.topbarTitle.textContent = chat?.title || 'New chat';
   el.messages.innerHTML = msgs.map((m) => messageHTML(m, chat)).join('');
   scrollToBottom(true);
+  updatePanelButton();
 }
 
 /** Re-render only one message in place — used after streaming or an edit. */
@@ -657,7 +714,28 @@ ${state.wsContext}`.trim();
   return out;
 }
 
+let thinkTimer = null;
+
+/** A running clock in the loader, so a slow model still reads as working. */
+function startThinkClock() {
+  stopThinkClock();
+  const t0 = performance.now();
+  const tick = () => {
+    const secs = (performance.now() - t0) / 1000;
+    const label = secs < 60 ? `${secs.toFixed(1)}s` : `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+    $$('.think-time').forEach((n) => { n.textContent = label; });
+  };
+  tick();
+  thinkTimer = setInterval(tick, 100);
+}
+
+function stopThinkClock() {
+  if (thinkTimer) clearInterval(thinkTimer);
+  thinkTimer = null;
+}
+
 function setBusy(busy) {
+  busy ? startThinkClock() : stopThinkClock();
   state.streaming = busy;
   el.sendBtn.hidden = busy;
   el.stopBtn.hidden = !busy;
@@ -690,8 +768,13 @@ async function runCompletion(chat, assistantMsg) {
   let usage = null;
 
   const agent = agentById(chat.agentId);
+  // OpenRouter runs a web search when the model id carries the :online suffix.
+  const requestModel = state.settings.web && !/:online$/.test(chat.model)
+    ? `${chat.model}:online`
+    : chat.model;
+
   const body = {
-    model: chat.model,
+    model: requestModel,
     messages: buildPayloadMessages(chat),
     temperature: typeof agent?.temperature === 'number' ? agent.temperature : s.temperature,
     top_p: s.topP,
@@ -736,11 +819,14 @@ async function runCompletion(chat, assistantMsg) {
 
       const paint = (finalPass = false) => {
         const target = node();
-        if (!target) return;
-        target.classList.add('md');
-        target.innerHTML = renderMarkdown(stripPartialAsk(acc));
-        target.classList.toggle('streaming', !finalPass);
-        scrollToBottom();
+        if (target) {
+          target.classList.add('md');
+          target.innerHTML = renderMarkdown(stripToolTokens(stripPartialAsk(acc)));
+          target.classList.toggle('streaming', !finalPass);
+          scrollToBottom();
+        }
+        // The panel follows the same cadence, so code appears as it is written.
+        artifactStream(assistantMsg, acc);
       };
 
       while (true) {
@@ -791,6 +877,7 @@ async function runCompletion(chat, assistantMsg) {
     assistantMsg.elapsed = Math.round(performance.now() - started);
     assistantMsg.tokens = usage?.completion_tokens || estTokens(acc);
     assistantMsg.promptTokens = usage?.prompt_tokens || 0;
+    addAutoSpend(chat.model, usage, assistantMsg.tokens);
 
     chat.updatedAt = Date.now();
     maybeTitle(chat);
@@ -799,6 +886,9 @@ async function runCompletion(chat, assistantMsg) {
     renderChatList();
     updateUsage();
     updateWorkspaceUI();
+    artifactSettle(assistantMsg);
+    await maybeAutoApply();
+    await serveReadRequests(chat, assistantMsg);
   } catch (err) {
     if (err.name === 'AbortError') {
       // Keep whatever streamed in before the user hit stop.
@@ -809,6 +899,7 @@ async function runCompletion(chat, assistantMsg) {
       chat.updatedAt = Date.now();
       saveChats();
       refreshMessage(assistantMsg.id);
+      artifactSettle(assistantMsg);
       toast('Generation stopped');
     } else {
       failMessage(chat, assistantMsg, 'Request failed', friendlyError(err.message), err.payload);
@@ -898,7 +989,23 @@ async function send(text) {
   if (state.streaming) return;
 
   // Selected workspace files ride along as context for this turn only.
+  state.readRounds = 0;   // a new question starts the read budget over
   state.wsContext = await wsContextBlock();
+
+  // Auto mode reads the request and picks the model before the turn is built.
+  if (state.settings.auto) {
+    const pick = autoPick(trimmed);
+    if (pick) {
+      chat.model = pick.model.id;
+      syncModelUI();
+      const picked = $('#autoPicked');
+      if (picked) picked.textContent = `Last pick: ${pick.model.name || pick.model.id} (${pick.tier})`;
+      if (pick.spentOut) toast("Today's budget is spent — using a free model", 'err', 4000);
+      el.statusLine.textContent = `Auto → ${pick.model.name || pick.model.id}`;
+    } else if (!state.models.length) {
+      toast('Auto mode needs the model list — open the model menu once to load it', 'err', 4000);
+    }
+  }
 
   const content = state.attachments.length
     ? [
@@ -916,7 +1023,8 @@ async function send(text) {
   updateComposerMeta();
   state.stick = true;
 
-  const assistant = { id: uid(), role: 'assistant', content: '', model: chat.model, pending: true, ts: Date.now() };
+  const assistant = { id: uid(), role: 'assistant', content: '', model: chat.model, pending: true,
+                      deliverable: state.deliverable || null, ts: Date.now() };
   chat.messages.push(assistant);
   chat.updatedAt = Date.now();
   maybeTitle(chat);
@@ -961,9 +1069,10 @@ function updateComposerMeta() {
   const base = m?.context_length
     ? `~${fmtNum(used)} / ${fmtNum(m.context_length)} ctx`
     : `~${fmtNum(used)} tokens in chat`;
-  el.ctxInfo.textContent = picked
-    ? `${base} · ${picked} file${picked === 1 ? '' : 's'} attached`
-    : base;
+  const bits = [base];
+  if (picked) bits.push(`${picked} file${picked === 1 ? '' : 's'} attached`);
+  if (terminalText()) bits.push('terminal output attached');
+  el.ctxInfo.textContent = bits.join(' · ');
 }
 
 function updateUsage() {
@@ -975,7 +1084,7 @@ function updateUsage() {
 function renderAttachments() {
   el.attachments.hidden = !state.attachments.length;
   el.attachments.innerHTML = state.attachments.map((src, i) =>
-    `<div class="attachment"><img src="${escapeHtml(src)}" alt=""><button type="button" data-action="drop-attachment" data-i="${i}">&times;</button></div>`
+    `<div class="attachment"><img src="${escapeHtml(src)}" alt=""><button type="button" data-action="drop-attachment" data-i="${i}" aria-label="Remove attachment"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`
   ).join('');
   updateComposerMeta();
 }
@@ -1023,8 +1132,11 @@ function applySettings() {
     el.hljsTheme.href = `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/${theme === 'light' ? 'vs' : 'vs2015'}.min.css`;
   }
   el.input.placeholder = s.enterSends
-    ? 'Message the model…  (Enter to send, Shift+Enter for a new line)'
-    : 'Message the model…  (Ctrl+Enter to send)';
+    ? 'Ask anything, or describe what you need…'
+    : 'Ask anything, or describe what you need…  (Ctrl+Enter to send)';
+
+  syncPlusMenu();
+  updateModeBar();
 }
 
 function syncSettingsForm() {
@@ -1054,6 +1166,9 @@ function syncSettingsForm() {
 
   $$('#themeSeg button').forEach((b) => b.classList.toggle('active', b.dataset.themeVal === s.theme));
   $$('#accentRow button').forEach((b) => b.classList.toggle('active', b.dataset.accent === s.accent));
+  $('#autoInput').checked = !!s.auto;
+  $('#autoBudgetInput').value = s.autoBudget ?? 1;
+  renderAutoUsage();
 
   const msgs = state.chats.reduce((n, c) => n + c.messages.length, 0);
   const toks = state.chats.reduce((n, c) => n + c.messages.reduce((k, m) => k + (m.tokens || estTokens(textOf(m))), 0), 0);
@@ -1162,10 +1277,12 @@ el.input.addEventListener('input', () => { autoGrow(); updateComposerMeta(); });
 
 el.input.addEventListener('keydown', (e) => {
   const s = state.settings;
-  if (e.key === 'Enter') {
-    const wantsSend = s.enterSends ? !e.shiftKey : (e.ctrlKey || e.metaKey);
-    if (wantsSend) { e.preventDefault(); send(el.input.value); }
-  }
+  if (e.key !== 'Enter') return;
+  if (e.isComposing || e.keyCode === 229) return;   // mid-IME composition
+  // Enter sends, Shift+Enter opens a line. Ctrl/Cmd+Enter always sends, so the
+  // key still works when the preference is turned off.
+  const wantsSend = s.enterSends ? !e.shiftKey : (e.ctrlKey || e.metaKey);
+  if (wantsSend) { e.preventDefault(); send(el.input.value); }
 });
 
 el.input.addEventListener('paste', (e) => {
@@ -1250,6 +1367,11 @@ el.messages.addEventListener('click', async (e) => {
       break;
     }
 
+    case 'open-artifact': {
+      openArtifact(id, Number(btn.dataset.index) || 0);
+      break;
+    }
+
     case 'export-msg': {
       if (index < 0) break;
       openExportMenu(btn, visibleText(chat.messages[index]), chat.title);
@@ -1323,6 +1445,16 @@ el.chatList.addEventListener('click', (e) => {
     renderChatList();
     updateUsage();
     toast('Conversation deleted');
+  }
+
+  if (btn.dataset.action === 'pin-chat') {
+    const chat = state.chats.find((c) => c.id === id);
+    if (!chat) return;
+    chat.pinned = !chat.pinned;
+    saveChats();
+    renderChatList();
+    toast(chat.pinned ? 'Pinned to the top' : 'Unpinned', '', 1400);
+    return;
   }
 
   if (btn.dataset.action === 'rename-chat') {
@@ -1630,6 +1762,7 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Escape') {
     if (state.streaming) { state.controller?.abort(); return; }
+    if (!el.artifact.hidden) { closeArtifact(); return; }
     const openModal = $$('.modal-root').find((m) => !m.hidden);
     if (openModal) { openModal.hidden = true; return; }
     closeExportMenu();
@@ -1644,6 +1777,7 @@ document.addEventListener('keydown', (e) => {
   if (mod && e.key === ',')               { e.preventDefault(); openSettings(); }
   if (mod && e.key === '/')               { e.preventDefault(); el.searchInput.focus(); }
   if (mod && e.key.toLowerCase() === 'm') { e.preventDefault(); el.modelBtn.click(); }
+  if (mod && e.key.toLowerCase() === 'u') { e.preventDefault(); el.fileInput.click(); }
   if (mod && e.key.toLowerCase() === 'j') { e.preventDefault(); $('#agentBtn').click(); }
 });
 
@@ -1657,7 +1791,16 @@ addEventListener('beforeunload', (e) => {
  * ---------------------------------------------------------- */
 
 function boot() {
+  // Older builds persisted enterSends:false on touch devices, which stuck even
+  // on a desktop. Restore the default once, then leave the preference alone.
+  if (state.settings.schema !== 2) {
+    state.settings.enterSends = DEFAULTS.enterSends;
+    state.settings.schema = 2;
+    writeJSON(KEYS.settings, state.settings);
+  }
+
   applySettings();
+  if (state.settings.ide) setLayout(true, { persist: false });
 
   if (!state.chats.length) newChat(false);
   if (!currentChat()) state.currentId = state.chats[0].id;
@@ -1673,15 +1816,12 @@ function boot() {
 
   setSidebarWidth(state.settings.sidebarW || DEFAULTS.sidebarW, false);
 
-  // A soft keyboard's Enter should insert a newline, so send needs a button there.
-  if (IS_TOUCH) {
-    state.settings.enterSends = false;
-    if (innerWidth <= 860) state.settings.sidebarCollapsed = true;
-    applySettings();
-  }
+  // Under 860px the rail becomes an overlay drawer, so it starts closed.
+  if (innerWidth <= 860) { state.settings.sidebarCollapsed = true; applySettings(); }
 
   renderChatList();
   renderMessages();
+  renderArtifactList();
   renderModelMenu();
   renderAgentMenu();
   renderAgentGrid();
@@ -1968,13 +2108,20 @@ function saveBlob(blob, name) {
 const safeName = (s, fallback) =>
   (s || '').replace(/[^\w\s.-]/g, '').trim().replace(/\s+/g, '-').slice(0, 48) || fallback;
 
+/* marked hands back HTML-escaped text, so a table cell arrives as
+   `&quot;apple&quot;`. Everything downstream — the sheet view, the .xlsx, the
+   .docx — wants the characters, and escapes again on its own. */
+const decodeEntities = (s) => String(s ?? '').replace(
+  /&(amp|lt|gt|quot|apos|#39|nbsp);/g,
+  (_, name) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'", nbsp: ' ' }[name]));
+
 /** Flatten a marked inline-token tree to plain text. */
 function plain(token) {
   if (token == null) return '';
-  if (typeof token === 'string') return token;
+  if (typeof token === 'string') return decodeEntities(token);
   if (Array.isArray(token)) return token.map(plain).join('');
   if (token.tokens?.length) return token.tokens.map(plain).join('');
-  return token.text ?? token.raw ?? '';
+  return decodeEntities(token.text ?? token.raw ?? '');
 }
 
 const lex = (md) => (window.marked ? marked.lexer(md || '') : []);
@@ -2153,6 +2300,15 @@ const EXT = {
 
 const FILENAME_RE = /^[\w./-]+\.[A-Za-z0-9]{1,8}$/;
 
+/* marked puts a `space` token between blocks, so the paragraph holding a file
+   path is rarely the token immediately before its fence. */
+function prevBlock(tokens, i) {
+  for (let k = i - 1; k >= 0; k--) {
+    if (tokens[k].type !== 'space') return tokens[k];
+  }
+  return null;
+}
+
 /** Pull a filename from the fence info string, or from the line just above it. */
 function fileNameFor(token, prev, index) {
   const info = (token.lang || '').trim();
@@ -2184,7 +2340,7 @@ async function exportZip(text, title) {
   const seen = new Set();
   tokens.forEach((t, i) => {
     if (t.type !== 'code') return;
-    let name = fileNameFor(t, tokens[i - 1], n);
+    let name = fileNameFor(t, prevBlock(tokens, i), n);
     while (seen.has(name)) name = name.replace(/(\.[^.]+)$/, `-${n}$1`);
     seen.add(name);
     zip.file(name, t.text ?? '');
@@ -2263,17 +2419,236 @@ function openExportMenu(anchor, text, title) {
   }), 0);
 }
 
+
+/* ============================================================
+ * Auto model
+ * ------------------------------------------------------------
+ * Reads the request, guesses how much thinking it needs, and
+ * spends accordingly — with a daily ceiling the user sets. Short
+ * questions go to a cheap model; code, analysis and long context
+ * go to a strong one. As the day's budget runs down the picks
+ * step down with it.
+ * ---------------------------------------------------------- */
+
+const AUTO_PREF = [
+  'anthropic/claude', 'openai/gpt', 'openai/o', 'google/gemini', 'x-ai/grok',
+  'deepseek', 'mistralai', 'meta-llama', 'qwen',
+];
+
+/** Dollars per million completion tokens. */
+function priceOf(m) {
+  const p = Number(m?.pricing?.completion || 0) * 1e6;
+  return Number.isFinite(p) ? p : 0;
+}
+
+const todayKey = () => new Date().toISOString().slice(0, 10);
+
+function autoSpendToday() {
+  const s = state.settings;
+  if (!s.autoSpend || s.autoSpend.day !== todayKey()) s.autoSpend = { day: todayKey(), amount: 0 };
+  return s.autoSpend;
+}
+
+const autoRemaining = () => Math.max(0, (state.settings.autoBudget || 0) - autoSpendToday().amount);
+
+/** How much thinking does this turn look like it needs? */
+function classifyRequest(text) {
+  const t = (text || '').toLowerCase().trim();
+  let score = 0;
+
+  if (t.length > 400) score += 1;
+  if (t.length > 1200) score += 1;
+  if (t.length < 60) score -= 1;
+  if (/^(hi|hey|hello|thanks|thank you|ok|okay|yes|no|sure)\b/.test(t)) score -= 2;
+
+  if (/```|\bcode\b|function |refactor|debug|stack trace|typescript|javascript|python|sql|regex|api\b/.test(t)) score += 2;
+  if (/analy|forecast|derive|prove|optimi|architect|trade-?off|strategy|migrat|reconcile|audit/.test(t)) score += 2;
+  if (/step by step|reason|explain in detail|compare|pros and cons|why does/.test(t)) score += 1;
+
+  if (state.deliverable) score += 1;
+  if (state.wsContext) score += 2;
+  if (state.attachments.length) score += 1;
+
+  return score >= 4 ? 'heavy' : score >= 2 ? 'standard' : 'light';
+}
+
+/** Pick a model for the tier, inside what is left of today's budget. */
+function autoPick(text) {
+  if (!state.models.length) return null;
+
+  const tier = classifyRequest(text);
+  const needVision = state.attachments.length > 0;
+  const left = autoRemaining();
+  const budget = state.settings.autoBudget || 0;
+
+  let target = { light: 0.4, standard: 2.5, heavy: 10 }[tier];
+  if (left <= 0) target = 0;                                  // spent out: free models only
+  else if (left < budget * 0.2) target = Math.min(target, 0.8);
+
+  const pool = state.models.filter((m) =>
+    canChat(m) && !isVariablePrice(m) && (!needVision || isVision(m)));
+  if (!pool.length) return null;
+
+  let best = null;
+  let bestScore = -Infinity;
+  for (const m of pool) {
+    const price = priceOf(m);
+    if (target === 0 && price > 0) continue;
+    if (target > 0 && price > target * 2.2 + 0.2) continue;
+
+    // Closest price to the tier's target, nudged by family and context length.
+    const closeness = -Math.abs(Math.log((price + 0.05) / (target + 0.05)));
+    const pref = AUTO_PREF.findIndex((p) => m.id.startsWith(p));
+    const prefScore = pref === -1 ? 0 : (AUTO_PREF.length - pref) * 0.1;
+    const ctx = Math.min((m.context_length || 0) / 1e6, 1) * 0.15;
+    const score = closeness + prefScore + ctx;
+    if (score > bestScore) { bestScore = score; best = m; }
+  }
+
+  if (!best) best = [...pool].sort((a, b) => priceOf(a) - priceOf(b))[0];
+  return best ? { model: best, tier, spentOut: left <= 0 } : null;
+}
+
+/** Add what a reply actually cost to today's total. */
+function addAutoSpend(modelId, usage, fallbackOut) {
+  const m = modelById(modelId);
+  if (!m) return;
+  const inPrice  = Number(m.pricing?.prompt || 0);
+  const outPrice = Number(m.pricing?.completion || 0);
+  const inTok  = usage?.prompt_tokens || 0;
+  const outTok = usage?.completion_tokens || fallbackOut || 0;
+  const cost = inTok * inPrice + outTok * outPrice;
+  if (!cost) return;
+
+  const spend = autoSpendToday();
+  spend.amount += cost;
+  saveSettings();
+  renderAutoUsage();
+}
+
+function renderAutoUsage() {
+  const budget = state.settings.autoBudget || 0;
+  const spent = autoSpendToday().amount;
+  const pct = budget ? Math.min(100, (spent / budget) * 100) : 0;
+
+  const amount = $('#autoSpent');
+  if (amount) amount.textContent = `$${spent.toFixed(4)}`;
+  const fill = $('#autoMeterFill');
+  if (fill) {
+    fill.style.width = `${pct}%`;
+    fill.classList.toggle('warn', pct >= 70 && pct < 90);
+    fill.classList.toggle('danger', pct >= 90);
+  }
+  const val = $('#autoBudgetVal');
+  if (val) val.textContent = `$${budget.toFixed(2)}`;
+  updateModeBar();
+}
+
+/* ---- The bar above the composer: whatever is switched on ---- */
+
+function updateModeBar() {
+  const bar = $('#deliverableBar');
+  if (!bar) return;
+
+  const chips = [];
+  if (state.deliverable) {
+    chips.push({ k: 'deliverable', label: `Reply shaped for: ${DELIVERABLES[state.deliverable].label}` });
+  }
+  if (state.settings.web) chips.push({ k: 'web', label: 'Web search on' });
+  if (state.settings.auto) {
+    chips.push({ k: 'auto', label: `Auto model · $${autoRemaining().toFixed(2)} left today` });
+  }
+
+  bar.hidden = !chips.length;
+  bar.innerHTML = chips.map((c) => `
+    <button type="button" class="mode-chip" data-mode="${c.k}" title="Turn this off">
+      <span>${escapeHtml(c.label)}</span>
+      <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>`).join('');
+}
+
+/* ---- The + menu ---- */
+
+function syncPlusMenu() {
+  $$('#deliverableMenu [data-toggle]').forEach((row) => {
+    row.classList.toggle('on', !!state.settings[row.dataset.toggle]);
+  });
+  $$('#deliverableMenu [data-deliverable]').forEach((row) => {
+    row.classList.toggle('on', state.deliverable === row.dataset.deliverable);
+  });
+}
+
+$('#deliverableMenu').addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-toggle]');
+  if (toggle) {
+    const key = toggle.dataset.toggle;
+    state.settings[key] = !state.settings[key];
+    saveSettings();
+    syncPlusMenu();
+    syncSettingsForm();
+    syncModelUI();
+    updateModeBar();
+    const said = {
+      web: state.settings.web ? 'Web search on — replies can cite live pages' : 'Web search off',
+      auto: state.settings.auto ? 'Auto model on — the app picks per request' : 'Auto model off',
+      autoApply: state.settings.autoApply
+        ? 'The assistant will write its files straight to the folder'
+        : 'Files wait for your review before being written',
+    };
+    toast(said[key] || '', '', 2600);
+    return;
+  }
+  if (e.target.closest('#attachBtn, #sysBtn, #folderMenuBtn')) {
+    $('#deliverablePicker').classList.remove('open');
+  }
+});
+
+$('#folderMenuBtn').addEventListener('click', () => {
+  setLayout(true);
+  openFolder();
+});
+
+$('#deliverableBar').addEventListener('click', (e) => {
+  const chip = e.target.closest('[data-mode]');
+  if (!chip) return;
+  const mode = chip.dataset.mode;
+  if (mode === 'deliverable') setDeliverable(null);
+  else { state.settings[mode] = false; saveSettings(); syncPlusMenu(); syncSettingsForm(); }
+  updateModeBar();
+});
+
+/* ---- Settings wiring ---- */
+
+$('#autoInput').addEventListener('change', (e) => {
+  state.settings.auto = e.target.checked;
+  saveSettings();
+  syncPlusMenu();
+  updateModeBar();
+  syncModelUI();
+});
+
+$('#autoBudgetInput').addEventListener('input', (e) => {
+  state.settings.autoBudget = Number(e.target.value);
+  saveSettings();
+  renderAutoUsage();
+});
+
+$('#autoReset').addEventListener('click', () => {
+  state.settings.autoSpend = { day: todayKey(), amount: 0 };
+  saveSettings();
+  renderAutoUsage();
+  toast("Today's auto spend reset", 'ok');
+});
+
 /* ============================================================
  * Deliverables
  * ---------------------------------------------------------- */
 
 function setDeliverable(kind) {
   state.deliverable = kind;
-  const bar = $('#deliverableBar');
-  if (!kind) { bar.hidden = true; return; }
-  $('#deliverableTag').textContent = `Reply shaped for: ${DELIVERABLES[kind].label}`;
-  bar.hidden = false;
-  el.input.focus();
+  syncPlusMenu();
+  updateModeBar();
+  if (kind) el.input.focus();
 }
 
 /* ============================================================
@@ -2369,7 +2744,7 @@ $('#deliverableMenu').addEventListener('click', (e) => {
   setDeliverable(btn.dataset.deliverable);
   $('#deliverablePicker').classList.remove('open');
 });
-$('#clearDeliverable').addEventListener('click', () => setDeliverable(null));
+
 
 document.addEventListener('click', (e) => {
   if (!$('#agentPicker').contains(e.target)) $('#agentPicker').classList.remove('open');
@@ -2397,6 +2772,34 @@ if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
 
 const FS_SUPPORTED = typeof window.showDirectoryPicker === 'function';
 
+/* Chrome still exposes the picker on file:// pages but refuses to open it, so
+   the protocol has to be part of the test rather than the property alone. */
+const FS_USABLE = FS_SUPPORTED && location.protocol !== 'file:';
+
+/**
+ * The handle API is fussy about where it runs. When it is missing the reason is
+ * almost always the page's context rather than the browser, so say which one it
+ * is — "unsupported" sends people looking for the wrong fix.
+ */
+function fsBlockedReason() {
+  if (FS_USABLE) return null;
+  if (location.protocol === 'file:') {
+    return 'This page is open straight from disk (a <b>file://</b> path). Chrome only offers folder ' +
+           'access over http, so start a server in this folder and reload:<br>' +
+           '<code>python -m http.server 5500</code> → <code>http://localhost:5500</code>';
+  }
+  if (window.top !== window.self) {
+    return 'The app is running inside an embedded preview. Open <b>http://localhost:5500</b> in a ' +
+           'normal browser tab and folder access comes back.';
+  }
+  if (!window.isSecureContext) {
+    return 'Folder access needs a secure page — <b>https</b> or <b>localhost</b>. This page is on ' +
+           `<b>${escapeHtml(location.origin)}</b>.`;
+  }
+  return 'This browser has no File System Access API. Chrome, Edge, Brave and Opera on the desktop ' +
+         'have it; Firefox and every iOS browser do not.';
+}
+
 /* Directories that are never worth reading into a prompt. */
 const WS_SKIP_DIRS = new Set([
   'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', '.next', '.nuxt',
@@ -2417,12 +2820,17 @@ const WS_MAX_BYTES = 200 * 1024;   // a single file we are willing to inline
 const WS_MAX_FILES = 4000;         // stop walking pathological trees
 
 const ws = {
-  root: null,       // FileSystemDirectoryHandle
+  root: null,       // FileSystemDirectoryHandle, or { name } for a read-only pick
+  readOnly: false,  // a folder <input> can be read but never written back
+  openFiles: [],    // { path, name, text, disk, dirty, lang } — the editor's tabs
   files: [],        // { path, name, dir, size, handle }
   dirs: new Set(),  // directory paths, for the tree
   open: new Set(),  // expanded directory paths
   picked: new Set(),// paths included in the prompt
 };
+
+/** Entries come from a directory handle or from a folder <input>; read both. */
+const wsFileOf = (f) => (f.file ? Promise.resolve(f.file) : f.handle.getFile());
 
 const wsExt = (name) => (name.includes('.') ? name.split('.').pop().toLowerCase() : name.toLowerCase());
 const wsIsText = (name) => WS_TEXT_EXT.has(wsExt(name)) || !name.includes('.');
@@ -2459,20 +2867,64 @@ async function wsScan(dirHandle, prefix = '') {
 }
 
 async function openFolder() {
-  if (!FS_SUPPORTED) return;
+  if (!FS_USABLE) return pickFolderReadOnly();
+
   let dir;
   try {
     dir = await window.showDirectoryPicker({ mode: 'readwrite' });
-  } catch {
-    return;   // the user dismissed the picker
+  } catch (err) {
+    if (err?.name === 'AbortError') return;          // the user dismissed the picker
+    console.error('[Nexus] directory picker failed', err);
+    toast(`Folder picker blocked: ${err.message} — falling back to a read-only pick`, 'err', 5000);
+    return pickFolderReadOnly();
   }
 
   ws.root = dir;
+  ws.readOnly = false;
   await rescanFolder();
+}
+
+/** Every browser can read a folder through an <input>; none can write back. */
+function pickFolderReadOnly() {
+  const input = $('#folderInput');
+  input.value = '';
+  input.click();
+}
+
+/** Build the same tree from a folder <input>'s FileList. */
+function loadFolderFromInput(fileList) {
+  const all = [...fileList];
+  if (!all.length) return;
+
+  const rootName = (all[0].webkitRelativePath || all[0].name).split('/')[0] || 'Folder';
+  ws.root = { name: rootName };
+  ws.readOnly = true;
+  ws.files = [];
+  ws.dirs = new Set();
+
+  for (const file of all) {
+    if (ws.files.length >= WS_MAX_FILES) break;
+
+    const rel = file.webkitRelativePath || file.name;
+    const path = rel.includes('/') ? rel.split('/').slice(1).join('/') : rel;
+    if (!path) continue;
+
+    const segs = path.split('/');
+    const name = segs.pop();
+    if (segs.some((d) => WS_SKIP_DIRS.has(d) || d.startsWith('.'))) continue;
+    if (!wsIsText(name) || file.size > WS_MAX_BYTES) continue;
+
+    let dir = '';
+    for (const s of segs) { dir = dir ? `${dir}/${s}` : s; ws.dirs.add(dir); }
+    ws.files.push({ path, name, dir: segs.join('/'), size: file.size, file });
+  }
+
+  wsFinishLoad();
 }
 
 async function rescanFolder() {
   if (!ws.root) return;
+  if (ws.readOnly) return pickFolderReadOnly();   // no handle to re-walk
   ws.files = [];
   ws.dirs = new Set();
 
@@ -2484,14 +2936,20 @@ async function rescanFolder() {
     return;
   }
 
+  wsFinishLoad();
+}
+
+function wsFinishLoad() {
   ws.files.sort((a, b) => a.path.localeCompare(b.path));
   // Only the top level starts expanded; deep trees stay manageable.
   ws.open = new Set([...ws.dirs].filter((d) => !d.includes('/')));
   ws.picked = new Set([...ws.picked].filter((p) => ws.files.some((f) => f.path === p)));
 
+  updateStatusBar();
   $('#wsMeta').hidden = false;
-  $('#wsRootName').textContent = ws.root.name;
+  $('#wsRootName').textContent = ws.readOnly ? `${ws.root.name} · read-only` : ws.root.name;
   $('#openFolderBtn').hidden = true;
+  $('#wsUnsupported').hidden = true;
   renderTree();
   updateWorkspaceUI();
   toast(`Opened ${ws.root.name} · ${ws.files.length} files`, 'ok');
@@ -2499,6 +2957,9 @@ async function rescanFolder() {
 
 function closeFolder() {
   ws.root = null;
+  ws.readOnly = false;
+  ws.openFiles = [];
+  if (!el.artifact.hidden && !panelItems().length) closeArtifact(); else if (!el.artifact.hidden) renderArtifact();
   ws.files = [];
   ws.dirs = new Set();
   ws.picked = new Set();
@@ -2512,20 +2973,33 @@ function closeFolder() {
 function renderTree() {
   const tree = $('#fileTree');
 
-  if (!FS_SUPPORTED) {
-    $('#wsUnsupported').hidden = false;
+  const blocked = fsBlockedReason();
+  $('#wsUnsupported').hidden = !(blocked && !ws.root);
+  if (blocked && !ws.root) {
     $('#wsUnsupported').innerHTML =
-      'Folder access needs the File System Access API, which only Chromium desktop browsers ' +
-      '(Chrome, Edge, Brave, Opera) provide. Firefox and all iOS browsers do not support it yet.';
-    tree.innerHTML = '';
-    $('#openFolderBtn').disabled = true;
-    return;
+      `${blocked}<br><br><b>Open folder</b> still works here — it reads the folder you pick, but ` +
+      'cannot write changes back.';
   }
 
   if (!ws.root) {
-    tree.innerHTML = '<div class="tree-empty">Open a folder to let the assistant read your code, ' +
-      'answer questions about it, and write changes back.</div>';
+    tree.innerHTML = `<div class="tree-empty">Open a folder to let the assistant read your code and ` +
+      `answer questions about it${blocked ? '.' : ', then write changes back.'}</div>`;
     return;
+  }
+
+  if (ws.readOnly) {
+    // Say why it is read-only and offer the way out, rather than just the fact.
+    const why = fsBlockedReason();
+    $('#wsUnsupported').hidden = false;
+    $('#wsUnsupported').innerHTML =
+      '<b>Read-only.</b> The assistant can read these files but cannot write to them.<br><br>' +
+      (why || 'The folder was picked through the file dialog, which hands over copies rather than ' +
+              'a handle to the folder itself.') +
+      '<div class="ws-fix">' +
+        (FS_USABLE
+          ? '<button type="button" class="ghost-btn sm" data-wsfix="reopen">Reopen with write access</button>'
+          : '<button type="button" class="ghost-btn sm" data-wsfix="tab">Open this app in a browser tab</button>') +
+      '</div>';
   }
   if (!ws.files.length) {
     tree.innerHTML = '<div class="tree-empty">No readable text files found in this folder.</div>';
@@ -2557,11 +3031,14 @@ function renderTree() {
   const fileRow = (f) => {
     const depth = f.dir ? f.dir.split('/').length : 0;
     const on = ws.picked.has(f.path);
-    return `<button class="tree-row ${on ? 'picked' : ''}" data-file="${escapeHtml(f.path)}" style="padding-left:${8 + depth * 12}px">
+    const open = wsOpenFile(f.path);
+    return `<button class="tree-row ${on ? 'picked' : ''} ${open ? 'open' : ''} ${open?.dirty ? 'dirty' : ''}"
+            data-file="${escapeHtml(f.path)}" style="padding-left:${8 + depth * 12}px"
+            title="Open ${escapeHtml(f.path)} — tick the box to send it to the model">
       <span class="tree-spacer"></span>
-      <span class="tree-check">✓</span>
+      <span class="tree-check" title="Include in the next message">✓</span>
       <span class="tree-name">${escapeHtml(f.name)}</span>
-      <span class="tree-size">${wsBytes(f.size)}</span>
+      <span class="tree-size">${open?.dirty ? '●' : wsBytes(f.size)}</span>
     </button>`;
   };
 
@@ -2578,16 +3055,34 @@ function renderTree() {
   tree.innerHTML = rows.join('');
 }
 
+/** The files the last reply wants to write, if a folder is open to write them into. */
+function pendingPatch() {
+  if (!ws.root) return [];
+  const chat = currentChat();
+  const last = chat?.messages.filter((m) => m.role === 'assistant' && !m.pending).slice(-1)[0];
+  return last ? parsePatch(textOf(last)) : [];
+}
+
 function updateWorkspaceUI() {
   const n = ws.picked.size;
   $('#wsFoot').hidden = !ws.root;
   $('#wsSelected').textContent = `${n} file${n === 1 ? '' : 's'} in context`;
 
-  // Applying changes only makes sense with a folder open and a reply on screen.
-  const chat = currentChat();
-  const last = chat?.messages.filter((m) => m.role === 'assistant' && !m.pending).slice(-1)[0];
-  const canApply = !!ws.root && !!last && parsePatch(textOf(last)).length > 0;
-  $('#applyPatchBtn').hidden = !canApply;
+  const files = pendingPatch();
+  $('#applyPatchBtn').hidden = !files.length;
+
+  // The same offer, but where the code actually is: above the editor.
+  const bar = $('#applyBar');
+  if (bar) {
+    bar.hidden = !files.length;
+    $('#applyBarText').textContent = ws.readOnly
+      ? `${files.length} file${files.length === 1 ? '' : 's'} written by the assistant — read-only folder`
+      : `The assistant changed ${files.length} file${files.length === 1 ? '' : 's'}`;
+    $('#applyAllBtn').disabled = ws.readOnly;
+    $('#applyAllBtn').title = ws.readOnly
+      ? 'Reopen the folder over http://localhost to write changes back'
+      : `Write all ${files.length} to ${ws.root?.name || 'the folder'}`;
+  }
 
   updateComposerMeta();
 }
@@ -2598,38 +3093,93 @@ function wsContextBytes() {
 }
 
 /** Read the selected files and format them for the prompt. */
-async function wsContextBlock() {
-  if (!ws.root || !ws.picked.size) return '';
+/* The model can only edit the project if it is told that it may, and how. This
+   goes with every turn a folder is open — not only when files are ticked. */
+const WRITE_PROTOCOL = [
+  '### Changing files',
+  '',
+  'You can edit this project. To write a file, put its path alone in backticks on the line',
+  'immediately before a fenced block holding the file\'s complete new contents:',
+  '',
+  '`src/app.js`',
+  '',
+  '```js',
+  '// the whole file, top to bottom',
+  '```',
+  '',
+  'Rules: always give the entire file, never a fragment and never "// ...rest unchanged".',
+  'One block per file, and only for files you actually changed. Use the exact path from the',
+  'listing above; a new file is written at whatever path you name. The user sees a diff and',
+  'accepts or rejects each file before anything touches the disk.',
+].join('\n');
 
-  const parts = [];
-  for (const f of ws.files) {
-    if (!ws.picked.has(f.path)) continue;
-    try {
-      const text = await (await f.handle.getFile()).text();
-      parts.push(`\`${f.path}\`\n\n\`\`\`${wsExt(f.name)}\n${text}\n\`\`\``);
-    } catch {
-      parts.push(`\`${f.path}\` — could not be read`);
+/* Small tool-tuned models will happily invent a filesystem and emit tool-call
+   tokens at it. Giving them a request format the app actually answers turns
+   that into something useful; forbidding the tokens keeps the rest quiet. */
+const READ_PROTOCOL = [
+  '### Reading more files',
+  '',
+  'You have no tools, no shell and no filesystem of your own — only what is pasted here.',
+  'If you need a file that is not included, ask for it with a fenced block of paths:',
+  '',
+  '```read',
+  'src/app.js',
+  'src/util/dates.py',
+  '```',
+  '',
+  'The app reads those paths out of the open folder, attaches them, and lets you continue.',
+  'Use paths exactly as they appear in the listing. Never emit tool-call tokens such as',
+  '<|tool_call_start|>, and never guess at absolute paths like /home/user/project.',
+].join('\n');
+
+async function wsContextBlock() {
+  const term = terminalText();
+  const blocks = [];
+
+  if (ws.root) {
+    const listing = ws.files.map((f) => f.path).slice(0, 400).join('\n');
+    blocks.push(`## Project: ${ws.root.name}`, '', 'Every file in it:', '```', listing, '```');
+
+    const shown = new Set();
+    const parts = [];
+
+    // What the user is looking at, including edits they have not saved yet.
+    for (const f of ws.openFiles.slice(0, 3)) {
+      shown.add(f.path);
+      parts.push(`\`${f.path}\`  (open in the editor${f.dirty ? ', unsaved changes' : ''})` +
+                 `\n\n\`\`\`${wsExt(f.name)}\n${f.text}\n\`\`\``);
+    }
+
+    // Everything ticked in the tree.
+    for (const f of ws.files) {
+      if (!ws.picked.has(f.path) || shown.has(f.path)) continue;
+      try {
+        const text = await (await wsFileOf(f)).text();
+        parts.push(`\`${f.path}\`\n\n\`\`\`${wsExt(f.name)}\n${text}\n\`\`\``);
+      } catch {
+        parts.push(`\`${f.path}\` — could not be read`);
+      }
+    }
+
+    blocks.push('', parts.length
+      ? 'The files in play right now:'
+      : 'No file contents are attached yet. Work from the listing, and ask for any file you need.');
+    if (parts.length) blocks.push('', parts.join('\n\n'));
+
+    blocks.push('', WRITE_PROTOCOL, '', READ_PROTOCOL);
+    if (ws.readOnly) {
+      blocks.push('', 'Note: this folder was opened read-only, so the user has to save your files ' +
+                      'by hand. Keep that in mind and mention it if it matters.');
     }
   }
-  if (!parts.length) return '';
 
-  const listing = ws.files.map((f) => f.path).slice(0, 300).join('\n');
-  return [
-    `## Workspace: ${ws.root.name}`,
-    '',
-    'Files in the project:',
-    '```',
-    listing,
-    '```',
-    '',
-    'Contents of the files the user selected:',
-    '',
-    parts.join('\n\n'),
-    '',
-    'When you change a file, output its complete new contents in a fenced code block and put the ' +
-    'file path alone in backticks on the line immediately before it, exactly as shown above. ' +
-    'Only include files you actually changed.',
-  ].join('\n');
+  if (term) {
+    blocks.push('', '## Terminal output from the user', '', '```', term, '```', '',
+                ws.root ? 'If it shows an error, trace it back to the files above and fix it there.'
+                        : 'If it shows an error, say what caused it and give the fix.');
+  }
+
+  return blocks.join('\n');
 }
 
 /* ---- Writing changes back ---- */
@@ -2644,7 +3194,7 @@ function parsePatch(text) {
 
   tokens.forEach((t, i) => {
     if (t.type !== 'code') return;
-    const name = fileNameFor(t, tokens[i - 1], out.length);
+    const name = fileNameFor(t, prevBlock(tokens, i), out.length);
     // Ignore the generic fallback: without a real path we must not write anything.
     if (/^file-\d+\./.test(name)) return;
     out.push({ path: name, content: t.text ?? '' });
@@ -2671,55 +3221,53 @@ async function applyPatch() {
   const files = parsePatch(textOf(last));
   if (!files.length) return toast('No file blocks with paths in that reply', 'err');
 
-  // Work out which are new so the confirmation is honest about what happens.
   for (const f of files) {
     f.exists = ws.files.some((x) => x.path === f.path);
     f.bytes = new Blob([f.content]).size;
   }
 
-  const summary = files
-    .map((f) => `  ${f.exists ? 'overwrite' : 'create   '}  ${f.path}  (${wsBytes(f.bytes)})`)
-    .join('\n');
-
-  if (!confirm(
-    `Write ${files.length} file${files.length === 1 ? '' : 's'} into ${ws.root.name}?\n\n${summary}\n\n` +
-    'Existing files are overwritten in place. This cannot be undone from here, so make sure ' +
-    'the folder is under version control.')) return;
-
-  let ok = 0;
-  const failed = [];
+  // Diff each one against what is on disk now, so the review shows real changes.
   for (const f of files) {
-    try {
-      const dir = await wsDirFor(f.path, true);
-      const handle = await dir.getFileHandle(f.path.split('/').pop(), { create: true });
-      const w = await handle.createWritable();
-      await w.write(f.content);
-      await w.close();
-      ok++;
-    } catch (err) {
-      failed.push(`${f.path}: ${err.message}`);
+    const entry = ws.files.find((x) => x.path === f.path);
+    f.current = '';
+    if (entry) {
+      try { f.current = await (await wsFileOf(entry)).text(); } catch { f.current = ''; }
     }
+    f.diff = diffLines(f.current, f.content);
+    f.accept = f.current !== f.content;
   }
 
-  await rescanFolder();
-  if (failed.length) {
-    console.error('[Nexus] write failures', failed);
-    toast(`Wrote ${ok}, failed ${failed.length}. See the console.`, 'err', 6000);
-  } else {
-    toast(`Wrote ${ok} file${ok === 1 ? '' : 's'} to ${ws.root.name}`, 'ok', 4000);
-  }
+  patchFiles = files;
+  renderPatchReview();
+  $('#patchModal').hidden = false;
 }
 
 /* ---- Wiring ---- */
 
 $$('.side-tab').forEach((tab) => {
   tab.addEventListener('click', () => {
+    if (!tab.dataset.side) return;   // Agents opens the settings dialog instead
+
     $$('.side-tab').forEach((t) => t.classList.toggle('active', t === tab));
     $$('.side-panel').forEach((p) => p.classList.toggle('active', p.dataset.sidePanel === tab.dataset.side));
+
+    // Chats and Artifacts read as a centred conversation; the explorer is the
+    // workspace, with the conversation moved to the side.
+    openSideView(tab.dataset.side);
   });
 });
 
 $('#openFolderBtn').addEventListener('click', openFolder);
+
+$('#wsUnsupported').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-wsfix]');
+  if (!btn) return;
+  if (btn.dataset.wsfix === 'reopen') openFolder();
+  else window.open(location.href, '_blank', 'noopener');
+});
+$('#folderInput').addEventListener('change', (e) => {
+  if (e.target.files?.length) loadFolderFromInput(e.target.files);
+});
 $('#wsRefresh').addEventListener('click', rescanFolder);
 $('#wsClose').addEventListener('click', closeFolder);
 $('#wsClearSel').addEventListener('click', () => {
@@ -2740,14 +3288,674 @@ $('#fileTree').addEventListener('click', (e) => {
   }
 
   const path = row.dataset.file;
-  ws.picked.has(path) ? ws.picked.delete(path) : ws.picked.add(path);
+
+  // The tick box controls what the model sees; the name opens the file.
+  if (e.target.closest('.tree-check')) {
+    ws.picked.has(path) ? ws.picked.delete(path) : ws.picked.add(path);
+    renderTree();
+    updateWorkspaceUI();
+    return;
+  }
+
+  openWorkspaceFile(path);
   renderTree();
-  updateWorkspaceUI();
 });
 
 $('#applyPatchBtn').addEventListener('click', applyPatch);
 
 renderTree();
+
+
+
+
+/* ============================================================
+ * Workspace layout
+ * ------------------------------------------------------------
+ * Chat layout is the default: conversation in the middle, files
+ * in a panel beside it. Workspace layout rearranges the same
+ * three regions into an editor — explorer on the left, the file
+ * being edited (with the terminal under it) in the middle, and
+ * the conversation on the right.
+ * ---------------------------------------------------------- */
+
+const IDE_MIN_WIDTH = 1100;
+
+function ideOn() {
+  return el.app.classList.contains('ide');
+}
+
+function setLayout(on, { persist = true } = {}) {
+  if (on && innerWidth <= IDE_MIN_WIDTH) {
+    toast('The workspace layout needs a wider window — showing the files panel instead', '', 4000);
+    on = false;
+  }
+
+  el.app.classList.toggle('ide', on);
+  $('#layoutBtn').classList.toggle('active', on);
+  $('#layoutBtn').title = on ? 'Back to the chat layout' : 'Workspace layout — explorer, editor, chat';
+
+  // The terminal belongs under the editor in this layout, and under the tree
+  // in the other one. Moving the node keeps its listeners intact.
+  const term = $('#wsTerminal');
+  if (on) {
+    el.artifact.insertBefore(term, $('.artifact-foot'));
+    el.artifact.hidden = false;
+    $('#artifactScrim').hidden = true;
+    // The explorer is the point of this layout, so show it.
+    showSideView('files');
+  } else {
+    $('.side-panel[data-side-panel="files"]').insertBefore(term, $('#wsFoot'));
+    // Leaving the workspace means a plain conversation: the side panel steps
+    // out of the way. Open files stay open, and the top-bar counter brings
+    // the panel back.
+    el.artifact.hidden = true;
+    el.app.classList.remove('panel-open');
+  }
+
+  if (persist) { state.settings.ide = on; saveSettings(); }
+  renderArtifact();
+  updatePanelButton();
+  updateStatusBar();
+}
+
+$('#layoutBtn').addEventListener('click', () => setLayout(!ideOn()));
+
+/* A window that shrinks below the threshold falls back on its own. */
+addEventListener('resize', () => {
+  if (ideOn() && innerWidth <= IDE_MIN_WIDTH) setLayout(false, { persist: false });
+});
+
+/* Drag the chat column's edge, the way the rail resizes. */
+(function initChatResizer() {
+  const grip = $('#mainResizer');
+  const root = document.documentElement;
+  const clamp = (px) => Math.max(320, Math.min(720, px));
+  const setW = (px) => root.style.setProperty('--chat-w', `${clamp(px)}px`);
+
+  let dragging = false;
+  grip.addEventListener('pointerdown', (e) => {
+    if (!ideOn()) return;
+    dragging = true;
+    grip.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+  });
+  grip.addEventListener('pointermove', (e) => { if (dragging) setW(innerWidth - e.clientX); });
+  const stop = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { grip.releasePointerCapture(e.pointerId); } catch {}
+    document.body.classList.remove('resizing');
+  };
+  grip.addEventListener('pointerup', stop);
+  grip.addEventListener('pointercancel', stop);
+  grip.addEventListener('keydown', (e) => {
+    if (!ideOn()) return;
+    const w = parseInt(getComputedStyle(root).getPropertyValue('--chat-w'), 10) || 420;
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); setW(w + 24); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); setW(w - 24); }
+  });
+})();
+
+
+
+/* ============================================================
+ * File requests
+ * ------------------------------------------------------------
+ * A model that wants a file gets it: the request is read out of
+ * the reply, the paths are resolved against the open folder, and
+ * the turn continues with the contents attached.
+ * ---------------------------------------------------------- */
+
+const READ_FENCE = /```read[ \t]*\r?\n([\s\S]*?)```/gi;
+const TOOL_CALL_READ = /read\s*\(\s*(?:path\s*=\s*)?["']([^"']+)["']\s*\)/gi;
+const TOOL_TOKENS = /<\|[a-z_]+\|>/gi;
+
+/** Paths the reply asked for, in either the app's format or a stray tool call. */
+function extractReadRequests(text) {
+  const out = [];
+  const src = text || '';
+
+  for (const m of src.matchAll(READ_FENCE)) {
+    for (const line of m[1].split('\n')) {
+      const p = line.trim().replace(/^[-*`\s]+|[`\s]+$/g, '');
+      if (p) out.push(p);
+    }
+  }
+  for (const m of src.matchAll(TOOL_CALL_READ)) out.push(m[1].trim());
+
+  return [...new Set(out)].slice(0, 6);
+}
+
+/** Match a requested path against the folder, however loosely it was written. */
+function resolveWsPath(request) {
+  const want = request.replace(/^[./]+/, '');
+  return ws.files.find((f) => f.path === want)
+      || ws.files.find((f) => f.path.endsWith(`/${want}`))
+      || ws.files.find((f) => f.name === want.split('/').pop())
+      || null;
+}
+
+/** Attach what the reply asked for and let it carry on. Bounded, so it cannot loop. */
+async function serveReadRequests(chat, msg) {
+  if (!ws.root) return false;
+  if (state.readRounds >= 2) return false;
+
+  const paths = extractReadRequests(textOf(msg));
+  if (!paths.length) return false;
+
+  const attached = [];
+  for (const p of paths) {
+    const entry = resolveWsPath(p);
+    if (!entry) { attached.push({ path: p, missing: true }); continue; }
+    try {
+      attached.push({ path: entry.path, name: entry.name, text: await (await wsFileOf(entry)).text() });
+    } catch {
+      attached.push({ path: p, missing: true });
+    }
+  }
+
+  const body = attached.map((a) => a.missing
+    ? `\`${a.path}\` — no such file in this folder`
+    : `\`${a.path}\`\n\n\`\`\`${wsExt(a.name)}\n${a.text}\n\`\`\``).join('\n\n');
+
+  chat.messages.push({
+    id: uid(),
+    role: 'user',
+    auto: true,
+    attached: attached.map((a) => (a.missing ? `${a.path} (missing)` : a.path)),
+    content: `Here are the files you asked for.\n\n${body}`,
+    ts: Date.now(),
+  });
+
+  const next = { id: uid(), role: 'assistant', content: '', model: chat.model, pending: true, ts: Date.now() };
+  chat.messages.push(next);
+  chat.updatedAt = Date.now();
+  saveChats();
+  renderMessages();
+
+  state.readRounds += 1;
+  await runCompletion(chat, next);
+  return true;
+}
+
+/* ============================================================
+ * Workspace chrome — rail, breadcrumbs, status bar
+ * ---------------------------------------------------------- */
+
+/** Switch which panel the rail (and the nav rows) are showing. */
+function showSideView(view) {
+  $$('.side-tab').forEach((t) => t.classList.toggle('active', t.dataset.side === view));
+  $$('.side-panel').forEach((p) => p.classList.toggle('active', p.dataset.sidePanel === view));
+  $$('.act-btn[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  el.app.classList.remove('collapsed');
+}
+
+$$('.act-btn[data-view]').forEach((btn) => {
+  btn.addEventListener('click', () => openSideView(btn.dataset.view));
+});
+
+/** A view and its layout: Explorer means the workspace, everything else the chat. */
+function openSideView(view) {
+  setLayout(view === 'files');
+  showSideView(view);
+}
+
+$('#actAgents').addEventListener('click', () => openSettings('agents'));
+$('#actSettings').addEventListener('click', () => openSettings());
+
+/** demo › src › app.js */
+function renderBreadcrumbs(item) {
+  const box = $('#breadcrumbs');
+  if (!box) return;
+
+  if (!item || !ideOn()) { box.hidden = true; return; }
+
+  const segs = item.kind === 'file'
+    ? [ws.root?.name, ...item.path.split('/')].filter(Boolean)
+    : [item.name];
+
+  box.hidden = false;
+  box.innerHTML = segs.map((s, i) => `
+    <span class="crumb${i === segs.length - 1 ? ' last' : ''}">${escapeHtml(s)}</span>
+    ${i < segs.length - 1 ? '<svg class="crumb-sep" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>' : ''}
+  `).join('');
+}
+
+const LANG_LABEL = {
+  javascript: 'JavaScript', typescript: 'TypeScript', python: 'Python', ruby: 'Ruby',
+  php: 'PHP', go: 'Go', rust: 'Rust', java: 'Java', kotlin: 'Kotlin', swift: 'Swift',
+  csharp: 'C#', c: 'C', cpp: 'C++', bash: 'Shell', powershell: 'PowerShell', sql: 'SQL',
+  json: 'JSON', yaml: 'YAML', ini: 'INI', markdown: 'Markdown', xml: 'XML', css: 'CSS',
+  scss: 'SCSS', less: 'Less',
+};
+
+function updateStatusBar() {
+  if (!$('#statusBar')) return;
+
+  const item = activeArtifact();
+  const file = item?.kind === 'file' ? wsOpenFile(item.path) : null;
+  const dirty = ws.openFiles.filter((f) => f.dirty).length;
+
+  $('#stFolder').textContent = ws.root
+    ? `${ws.root.name}${ws.readOnly ? ' (read-only)' : ''} · ${ws.files.length} files`
+    : 'No folder open';
+  $('#stDirty').textContent = dirty ? `● ${dirty} unsaved` : '';
+  $('#stDirty').classList.toggle('warn', !!dirty);
+
+  const chat = currentChat();
+  const model = modelById(chat?.model || state.settings.model);
+  $('#stModel').textContent = model?.name || chat?.model || '';
+
+  $('#stLang').textContent = file
+    ? (LANG_LABEL[file.lang] || (wsExt(file.name) || 'text').toUpperCase())
+    : (item ? 'Output' : 'Plain text');
+
+  if (!file) $('#stCursor').textContent = '';
+}
+
+/** Ln/Col follows the caret in the editor, the way the real status bar does. */
+function updateCursorStatus(area) {
+  const box = $('#stCursor');
+  if (!box || !area) return;
+  const upto = area.value.slice(0, area.selectionStart);
+  const line = upto.split('\n').length;
+  const col = upto.length - upto.lastIndexOf('\n');
+  box.textContent = `Ln ${line}, Col ${col}`;
+}
+
+['keyup', 'click', 'input', 'select'].forEach((evt) => {
+  el.artifactBody.addEventListener(evt, (e) => {
+    const area = e.target.closest?.('.edit-area');
+    if (area) updateCursorStatus(area);
+  }, true);
+});
+
+/* ============================================================
+ * Reviewing the assistant's changes
+ * ------------------------------------------------------------
+ * Writing files straight to disk on trust is not reviewable, so
+ * the reply's files are diffed against what is there now and
+ * each one is accepted or skipped by hand.
+ * ---------------------------------------------------------- */
+
+/** Longest-common-subsequence line diff, capped so a huge pair cannot hang the tab. */
+function diffLines(before, after) {
+  const A = before ? before.split('\n') : [];
+  const B = after ? after.split('\n') : [];
+
+  if (A.length * B.length > 4000000) {
+    return [{ type: 'note', text: `${A.length} lines replaced by ${B.length} — too large to diff here.` }];
+  }
+
+  const m = A.length;
+  const n = B.length;
+  const dp = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (A[i] === B[j]) { out.push({ type: 'ctx', text: A[i], a: i + 1, b: j + 1 }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ type: 'del', text: A[i], a: i + 1 }); i++; }
+    else { out.push({ type: 'add', text: B[j], b: j + 1 }); j++; }
+  }
+  while (i < m) { out.push({ type: 'del', text: A[i], a: i + 1 }); i++; }
+  while (j < n) { out.push({ type: 'add', text: B[j], b: j + 1 }); j++; }
+  return out;
+}
+
+/** Keep three lines either side of each change; fold the rest away. */
+function foldDiff(rows, pad = 3) {
+  const keep = new Set();
+  rows.forEach((r, i) => {
+    if (r.type === 'ctx') return;
+    for (let k = i - pad; k <= i + pad; k++) if (k >= 0 && k < rows.length) keep.add(k);
+  });
+
+  const out = [];
+  let skipped = 0;
+  rows.forEach((r, i) => {
+    if (keep.has(i) || r.type === 'note') {
+      if (skipped) { out.push({ type: 'fold', text: `${skipped} unchanged line${skipped === 1 ? '' : 's'}` }); skipped = 0; }
+      out.push(r);
+    } else {
+      skipped++;
+    }
+  });
+  if (skipped) out.push({ type: 'fold', text: `${skipped} unchanged line${skipped === 1 ? '' : 's'}` });
+  return out;
+}
+
+let patchFiles = [];
+
+function renderPatchReview() {
+  const box = $('#patchBody');
+
+  box.innerHTML = patchFiles.map((f, i) => {
+    const adds = f.diff.filter((r) => r.type === 'add').length;
+    const dels = f.diff.filter((r) => r.type === 'del').length;
+    const rows = foldDiff(f.diff).map((r) => {
+      if (r.type === 'fold') return `<div class="diff-row fold">${escapeHtml(r.text)}</div>`;
+      if (r.type === 'note') return `<div class="diff-row fold">${escapeHtml(r.text)}</div>`;
+      const sign = r.type === 'add' ? '+' : r.type === 'del' ? '-' : ' ';
+      return `<div class="diff-row ${r.type}"><span class="diff-num">${r.a ?? ''}</span><span class="diff-num">${r.b ?? ''}</span><span class="diff-sign">${sign}</span><span class="diff-text">${escapeHtml(r.text)}</span></div>`;
+    }).join('');
+
+    return `
+      <div class="patch-file ${f.accept ? '' : 'skipped'}" data-i="${i}">
+        <label class="patch-head">
+          <input type="checkbox" ${f.accept ? 'checked' : ''} data-accept="${i}" />
+          <span class="switch"></span>
+          <code>${escapeHtml(f.path)}</code>
+          <span class="patch-badge ${f.exists ? 'mod' : 'new'}">${f.exists ? 'modified' : 'new file'}</span>
+          <span class="patch-stat"><b class="add">+${adds}</b> <b class="del">-${dels}</b></span>
+          <span class="patch-size">${wsBytes(f.bytes)}</span>
+        </label>
+        <div class="diff-view">${rows || '<div class="diff-row fold">No changes — the file already matches.</div>'}</div>
+      </div>`;
+  }).join('');
+
+  const on = patchFiles.filter((f) => f.accept).length;
+  $('#patchSummary').textContent = ws.readOnly
+    ? 'This folder was opened read-only — reopen it over http://localhost to write changes back'
+    : `${on} of ${patchFiles.length} selected`;
+  $('#patchApply').disabled = !on || ws.readOnly;
+  $('#patchApply').textContent = `Write ${on} file${on === 1 ? '' : 's'}`;
+}
+
+$('#patchBody').addEventListener('change', (e) => {
+  const box = e.target.closest('[data-accept]');
+  if (!box) return;
+  patchFiles[Number(box.dataset.accept)].accept = box.checked;
+  renderPatchReview();
+});
+
+/** Write a set of {path, content} to disk and fold the result back into the UI. */
+async function writePatchFiles(files) {
+  if (!files.length) return 0;
+  if (ws.readOnly) {
+    toast('This folder is read-only — reopen it over http://localhost to let the assistant write', 'err', 6000);
+    return 0;
+  }
+
+  let ok = 0;
+  const failed = [];
+
+  for (const f of files) {
+    try {
+      const dir = await wsDirFor(f.path, true);
+      const handle = await dir.getFileHandle(f.path.split('/').pop(), { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(f.content);
+      await writable.close();
+      ok++;
+
+      // An open tab should show what is now on disk, not the stale buffer.
+      const open = wsOpenFile(f.path);
+      if (open) { open.text = f.content; open.disk = f.content; open.dirty = false; }
+    } catch (err) {
+      failed.push(`${f.path}: ${err.message}`);
+    }
+  }
+
+  await rescanFolder();
+  if (!el.artifact.hidden) renderArtifact();
+  updateWorkspaceUI();
+
+  if (failed.length) {
+    console.error('[Nexus] write failures', failed);
+    toast(`Wrote ${ok}, failed ${failed.length}. See the console.`, 'err', 6000);
+  } else {
+    toast(`Wrote ${ok} file${ok === 1 ? '' : 's'} to ${ws.root.name}`, 'ok', 4000);
+  }
+  return ok;
+}
+
+$('#patchApply').addEventListener('click', async () => {
+  const chosen = patchFiles.filter((f) => f.accept);
+  if (!chosen.length) return;
+  $('#patchModal').hidden = true;
+  await writePatchFiles(chosen);
+});
+
+$('#applyReviewBtn').addEventListener('click', applyPatch);
+
+$('#applyAllBtn').addEventListener('click', async () => {
+  const files = pendingPatch();
+  if (!files.length) return;
+  await writePatchFiles(files);
+});
+
+/* ============================================================
+ * Terminal output
+ * ------------------------------------------------------------
+ * A page cannot run commands, so this is the honest version: you
+ * paste (or load) what your terminal printed and it rides along
+ * with the next message.
+ * ---------------------------------------------------------- */
+
+const terminalText = () => ($('#wsTermAttach')?.checked ? ($('#wsTermInput')?.value.trim() || '') : '');
+
+function updateTerminalUI() {
+  const text = $('#wsTermInput')?.value.trim() || '';
+  const on = $('#wsTermAttach')?.checked;
+  const state = $('#wsTermState');
+  if (state) {
+    state.textContent = text ? `${text.split('\n').length} lines${on ? '' : ' · muted'}` : '';
+    state.classList.toggle('on', !!text && on);
+  }
+  updateComposerMeta();
+}
+
+$('#wsTermToggle').addEventListener('click', () => {
+  const body = $('#wsTermBody');
+  body.hidden = !body.hidden;
+  $('#wsTermToggle').setAttribute('aria-expanded', String(!body.hidden));
+  $('#wsTermToggle').classList.toggle('open', !body.hidden);
+  if (!body.hidden) $('#wsTermInput').focus();
+});
+
+$('#wsTermInput').addEventListener('input', updateTerminalUI);
+$('#wsTermAttach').addEventListener('change', updateTerminalUI);
+
+$('#wsTermClear').addEventListener('click', () => {
+  $('#wsTermInput').value = '';
+  updateTerminalUI();
+});
+
+$('#wsTermLoad').addEventListener('click', () => $('#wsTermFile').click());
+
+$('#wsTermFile').addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const text = await file.text();
+    $('#wsTermInput').value = text.length > 40000 ? `…\n${text.slice(-40000)}` : text;
+    updateTerminalUI();
+    toast(`Loaded ${file.name}`, 'ok');
+  } catch (err) {
+    toast(`Could not read ${file.name}: ${err.message}`, 'err');
+  }
+});
+
+/* ============================================================
+ * Workspace editor
+ * ------------------------------------------------------------
+ * A file from the tree opens as a tab in the output panel, next
+ * to whatever the assistant has written. Highlighted text sits
+ * under a transparent textarea, which is the cheapest honest way
+ * to get a coloured, editable buffer without a whole editor.
+ * ---------------------------------------------------------- */
+
+const HL_BY_EXT = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript', py: 'python', rb: 'ruby', php: 'php',
+  go: 'go', rs: 'rust', java: 'java', kt: 'kotlin', swift: 'swift', cs: 'csharp',
+  c: 'c', h: 'c', cpp: 'cpp', hpp: 'cpp', sh: 'bash', bash: 'bash', zsh: 'bash',
+  ps1: 'powershell', sql: 'sql', json: 'json', yml: 'yaml', yaml: 'yaml',
+  toml: 'ini', ini: 'ini', cfg: 'ini', md: 'markdown', markdown: 'markdown',
+  html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml', vue: 'xml', css: 'css',
+  scss: 'scss', less: 'less',
+};
+
+const wsOpenFile = (path) => ws.openFiles.find((f) => f.path === path);
+
+/** Read a file from the tree and show it in the panel. */
+async function openWorkspaceFile(path) {
+  const entry = ws.files.find((f) => f.path === path);
+  if (!entry) return;
+
+  let file = wsOpenFile(path);
+  if (!file) {
+    let text;
+    try {
+      text = await (await wsFileOf(entry)).text();
+    } catch (err) {
+      toast(`Could not read ${path}: ${err.message}`, 'err', 5000);
+      return;
+    }
+    file = { path, name: entry.name, text, disk: text, dirty: false, lang: HL_BY_EXT[wsExt(entry.name)] || '' };
+    ws.openFiles.push(file);
+  }
+
+  artifactState.key = `file:${path}`;
+  artifactState.dismissed = null;
+  el.artifact.hidden = false;
+  el.app.classList.add('panel-open');
+  $('#artifactScrim').hidden = false;
+  renderArtifact();
+  updatePanelButton();
+}
+
+function closeWorkspaceFile(path) {
+  const file = wsOpenFile(path);
+  if (file?.dirty && !confirm(`${path} has unsaved changes. Close it anyway?`)) return;
+  ws.openFiles = ws.openFiles.filter((f) => f.path !== path);
+  renderTree();
+  panelItems().length ? renderArtifact() : closeArtifact();
+  updatePanelButton();
+}
+
+async function saveWorkspaceFile(file) {
+  if (!file || !ws.root) return;
+  if (ws.readOnly) {
+    toast('This folder was opened read-only — reopen it over http://localhost to save', 'err', 5000);
+    return;
+  }
+
+  try {
+    const dir = await wsDirFor(file.path, false);
+    const handle = await dir.getFileHandle(file.name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(file.text);
+    await writable.close();
+  } catch (err) {
+    console.error('[Nexus] save failed', err);
+    toast(`Could not save ${file.path}: ${err.message}`, 'err', 6000);
+    return;
+  }
+
+  file.disk = file.text;
+  file.dirty = false;
+  updateStatusBar();
+  const entry = ws.files.find((f) => f.path === file.path);
+  if (entry) entry.size = new Blob([file.text]).size;
+  renderArtifact();
+  renderTree();
+  toast(`Saved ${file.path}`, 'ok');
+}
+
+function editorBodyHTML(file) {
+  const lang = window.hljs?.getLanguage(file.lang) ? file.lang : '';
+  let body;
+  try {
+    body = lang ? hljs.highlight(file.text, { language: lang }).value : escapeHtml(file.text);
+  } catch {
+    body = escapeHtml(file.text);
+  }
+  const gutter = file.text.split('\n').map((_, i) => i + 1).join('\n');
+
+  return `
+    <div class="art-code art-editor">
+      <pre class="art-gutter" aria-hidden="true">${gutter}</pre>
+      <div class="edit-wrap">
+        <pre class="edit-hl" aria-hidden="true"><code class="hljs language-${escapeHtml(lang)}">${body}</code></pre>
+        <textarea class="edit-area" spellcheck="false" data-path="${escapeHtml(file.path)}"
+                  ${ws.readOnly ? 'readonly' : ''}>${escapeHtml(file.text)}</textarea>
+      </div>
+    </div>`;
+}
+
+/* Repaint the highlight layer as the user types, but not on every keystroke. */
+let hlTimer = null;
+
+el.artifactBody.addEventListener('input', (e) => {
+  const area = e.target.closest('.edit-area');
+  if (!area) return;
+
+  const file = wsOpenFile(area.dataset.path);
+  if (!file) return;
+  file.text = area.value;
+  file.dirty = file.text !== file.disk;
+
+  const tab = el.artifactTabs.querySelector(`[data-tab-key="file:${CSS.escape(file.path)}"]`);
+  if (tab) tab.classList.toggle('dirty', file.dirty);
+  $('#artifactMeta').textContent =
+    `${file.text.split('\n').length} lines · ${file.dirty ? 'unsaved changes' : 'saved'}`;
+  updateStatusBar();
+
+  clearTimeout(hlTimer);
+  hlTimer = setTimeout(() => {
+    const hl = el.artifactBody.querySelector('.edit-hl code');
+    const gut = el.artifactBody.querySelector('.art-gutter');
+    if (!hl) return;
+    const lang = window.hljs?.getLanguage(file.lang) ? file.lang : '';
+    try {
+      hl.innerHTML = lang ? hljs.highlight(file.text, { language: lang }).value : escapeHtml(file.text);
+    } catch {
+      hl.textContent = file.text;
+    }
+    if (gut) gut.textContent = file.text.split('\n').map((_, i) => i + 1).join('\n');
+  }, 140);
+});
+
+/* The highlight sits behind the textarea, so the two must scroll as one. */
+el.artifactBody.addEventListener('scroll', (e) => {
+  const area = e.target.closest('.edit-area');
+  if (!area) return;
+  const hl = area.previousElementSibling;
+  if (hl) { hl.scrollTop = area.scrollTop; hl.scrollLeft = area.scrollLeft; }
+}, true);
+
+el.artifactBody.addEventListener('keydown', (e) => {
+  const area = e.target.closest('.edit-area');
+  if (!area) return;
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveWorkspaceFile(wsOpenFile(area.dataset.path));
+    return;
+  }
+  // Tab inserts a tab rather than leaving the editor.
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const { selectionStart: a, selectionEnd: b, value } = area;
+    area.value = `${value.slice(0, a)}  ${value.slice(b)}`;
+    area.selectionStart = area.selectionEnd = a + 2;
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+});
+
+$('#artifactSave').addEventListener('click', () => {
+  const item = activeArtifact();
+  if (item?.kind === 'file') saveWorkspaceFile(wsOpenFile(item.path));
+});
 
 /* ============================================================
  * Clarifying questions
@@ -2806,6 +4014,12 @@ function extractAsk(text) {
 
 /** Hide a half-arrived ask block while the reply is still streaming. */
 const stripPartialAsk = (text) => (text || '').replace(ASK_PARTIAL, '').trimEnd();
+
+/* Tool-call tokens are noise from a model talking to tools that are not there. */
+const stripToolTokens = (text) => (text || '')
+  .replace(/<\|[a-z_]+\|>/gi, '')
+  .replace(/^\s*\[\s*read\s*\([^\]]*\)\s*\]\s*$/gim, '')
+  .trim();
 
 /** The text a user should get when copying or exporting a reply. */
 const visibleText = (msg) => extractAsk(textOf(msg)).text;
@@ -3016,6 +4230,650 @@ document.addEventListener('keydown', (e) => {
   const opt = card.querySelectorAll('.ask-opt')[Number(e.key) - 1];
   if (opt) { e.preventDefault(); opt.click(); }
 });
+
+
+/* ============================================================
+ * Output panel
+ * ------------------------------------------------------------
+ * Long replies are mostly scaffolding around one thing the user
+ * actually wants: a file, a table, a script. The panel lifts that
+ * out beside the conversation, fills in as the model writes, and
+ * hands it over as .xlsx, .zip or a plain file.
+ * ---------------------------------------------------------- */
+
+const EXT_BY_LANG = {
+  javascript: 'js', js: 'js', typescript: 'ts', ts: 'ts', jsx: 'jsx', tsx: 'tsx',
+  python: 'py', py: 'py', html: 'html', css: 'css', json: 'json', sql: 'sql',
+  bash: 'sh', sh: 'sh', shell: 'sh', yaml: 'yml', yml: 'yml', java: 'java',
+  csharp: 'cs', cs: 'cs', cpp: 'cpp', c: 'c', go: 'go', rust: 'rs', php: 'php',
+  ruby: 'rb', swift: 'swift', kotlin: 'kt', markdown: 'md', md: 'md', xml: 'xml',
+};
+
+const artifactState = { key: null, dismissed: null };
+const artifactCache = new Map();   // msg.id -> { len, items }
+
+/** An unterminated fence mid-stream would swallow the rest of the reply. */
+function closeFences(text) {
+  const fences = (text.match(/^```/gm) || []).length;
+  return fences % 2 ? `${text}\n\`\`\`` : text;
+}
+
+function collectArtifacts(text) {
+  const tokens = lex(closeFences(text || ''));
+  const items = [];
+  let heading = '';
+  let codeN = 0;
+  let tableN = 0;
+
+  tokens.forEach((t, i) => {
+    if (t.type === 'heading') heading = plain(t).trim();
+
+    if (t.type === 'code') {
+      const code = t.text ?? '';
+      if (!code.trim()) return;
+      const lang = (t.lang || '').trim().split(/\s+/)[0].toLowerCase();
+      items.push({ kind: 'code', lang, code, name: fileNameFor(t, prevBlock(tokens, i), codeN++) });
+    }
+
+    if (t.type === 'table') {
+      items.push({
+        kind: 'table',
+        name: heading || `Table ${++tableN}`,
+        header: t.header.map(plain),
+        rows: t.rows.map((r) => r.map(plain)),
+      });
+      heading = '';
+    }
+  });
+
+  return items;
+}
+
+function artifactsFor(msg) {
+  if (!msg || msg.role !== 'assistant') return [];
+  const text = textOf(msg);
+  const hit = artifactCache.get(msg.id);
+
+  let items;
+  if (hit && hit.len === text.length) {
+    items = hit.items;
+  } else {
+    // idx is the position in the reply and never shifts, so a deleted block
+    // cannot drag the others' identities along with it.
+    items = collectArtifacts(text).map((it, i) => ({ ...it, idx: i }));
+    artifactCache.set(msg.id, { len: text.length, items });
+  }
+
+  const hidden = msg.hiddenArtifacts;
+  return hidden?.length ? items.filter((it) => !hidden.includes(it.idx)) : items;
+}
+
+function findMessage(msgId) {
+  for (const chat of state.chats) {
+    const msg = chat.messages.find((m) => m.id === msgId);
+    if (msg) return { chat, msg };
+  }
+  return null;
+}
+
+/** Drop one file or table from the set. The reply itself is left alone. */
+function deleteArtifact(msgId, idx) {
+  const found = findMessage(msgId);
+  if (!found) return;
+  const { chat, msg } = found;
+
+  msg.hiddenArtifacts = [...new Set([...(msg.hiddenArtifacts || []), Number(idx)])];
+  saveChats();
+
+  if (chat.id === state.currentId) {
+    refreshMessage(msg.id);
+    if (!el.artifact.hidden) {
+      chatArtifacts().length ? renderArtifact() : closeArtifact();
+    }
+  }
+  renderArtifactList();
+  updatePanelButton();
+  toast('Removed from files — the reply still has it', '', 3000);
+}
+
+function hiddenArtifactCount() {
+  return state.chats.reduce((n, c) =>
+    n + c.messages.reduce((s, m) => s + (m.hiddenArtifacts?.length || 0), 0), 0);
+}
+
+function restoreArtifacts() {
+  for (const chat of state.chats) {
+    for (const msg of chat.messages) delete msg.hiddenArtifacts;
+  }
+  saveChats();
+  renderMessages();
+  renderArtifactList();
+  updatePanelButton();
+  if (!el.artifact.hidden) renderArtifact();
+  toast('Restored every removed file', 'ok');
+}
+
+const CODE_ICON  = '<svg viewBox="0 0 24 24"><path d="M8 8l-4 4 4 4M16 8l4 4-4 4"/></svg>';
+const SHEET_ICON = '<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M4 10h16M10 10v9"/></svg>';
+
+/** The card under a reply that opens the panel again. */
+function artifactChipHTML(msg) {
+  const items = artifactsFor(msg);
+  if (!items.length) return '';
+
+  const sheets = items.filter((a) => a.kind === 'table').length;
+  const files  = items.length - sheets;
+  const lead   = items[0];
+  const bits   = [];
+  if (files)  bits.push(`${files} file${files === 1 ? '' : 's'}`);
+  if (sheets) bits.push(`${sheets} table${sheets === 1 ? '' : 's'}`);
+
+  return `
+    <button class="art-chip" data-action="open-artifact" data-id="${msg.id}" data-index="${lead.idx}" type="button">
+      <span class="art-chip-ico">${lead.kind === 'table' ? SHEET_ICON : CODE_ICON}</span>
+      <span class="art-chip-text">
+        <b>${escapeHtml(lead.name)}</b>
+        <em>${bits.join(' &middot; ')} &middot; open in the panel</em>
+      </span>
+      <svg class="art-chip-go" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+    </button>`;
+}
+
+const artifactKey = (msgId, i) => `${msgId}:${i}`;
+
+/** Every file and table in the open conversation, in the order they were written. */
+function chatArtifacts() {
+  const chat = currentChat();
+  const out = [];
+  for (const m of chat?.messages || []) {
+    if (m.role !== 'assistant') continue;
+    artifactsFor(m).forEach((item) => out.push({ ...item, msgId: m.id, key: artifactKey(m.id, item.idx) }));
+  }
+  return out;
+}
+
+/** Tabs in the panel: open workspace files first, then what the chat produced. */
+function panelItems() {
+  const files = ws.openFiles.map((f) => ({
+    kind: 'file', key: `file:${f.path}`, name: f.name, path: f.path,
+    lang: f.lang, dirty: f.dirty,
+  }));
+  return [...files, ...chatArtifacts()];
+}
+
+function activeArtifact(list = panelItems()) {
+  if (!list.length) return null;
+  return list.find((a) => a.key === artifactState.key) || list[list.length - 1];
+}
+
+function tabsHTML(items, active) {
+  return items.map((a) => `
+    <button class="art-tab ${a.key === active.key ? 'active' : ''} ${a.dirty ? 'dirty' : ''}"
+            data-tab-key="${a.key}" role="tab">
+      ${a.kind === 'table' ? SHEET_ICON : CODE_ICON}<span>${escapeHtml(a.name)}</span>
+      ${a.kind === 'file' ? `<span class="tab-close" data-close-file="${escapeHtml(a.path)}">&times;</span>` : ''}
+    </button>`).join('');
+}
+
+function artifactMessage(item) {
+  const chat = currentChat();
+  return chat?.messages.find((m) => m.id === (item || activeArtifact())?.msgId) || null;
+}
+
+function openArtifact(msgId, index = 0) {
+  artifactState.key = artifactKey(msgId, index);
+  artifactState.dismissed = null;
+  el.artifact.hidden = false;
+  el.app.classList.add('panel-open');
+  $('#artifactScrim').hidden = false;
+  renderArtifact();
+}
+
+function closeArtifact() {
+  if (ideOn()) { renderArtifact(); return; }   // the editor column is permanent here
+  if (!el.artifact || el.artifact.hidden) return;
+  artifactState.dismissed = activeArtifact()?.msgId || null;
+  el.artifact.hidden = true;
+  el.app.classList.remove('panel-open');
+  $('#artifactScrim').hidden = true;
+  updatePanelButton();
+}
+
+/** The top-bar button: how many files this conversation has produced. */
+function updatePanelButton() {
+  const btn = $('#panelBtn');
+  if (!btn) return;
+  const n = chatArtifacts().length;
+  btn.hidden = n === 0 || ideOn();   // in the workspace layout the editor is always on screen
+  $('#panelCount').textContent = n;
+  btn.classList.toggle('active', !el.artifact.hidden);
+  btn.title = `${n} file${n === 1 ? '' : 's'} in this chat`;
+  const nav = $('#navArtifactCount');
+  if (nav) {
+    const total = state.chats.reduce((sum, c) => sum + c.messages.reduce(
+      (s, m) => s + (m.role === 'assistant' ? artifactsFor(m).length : 0), 0), 0);
+    nav.textContent = total || '';
+  }
+}
+
+/** Column letters, so a sheet preview reads like a spreadsheet. */
+function colName(i) {
+  let s = '';
+  for (let n = i; n >= 0; n = Math.floor(n / 26) - 1) s = String.fromCharCode(65 + (n % 26)) + s;
+  return s;
+}
+
+function artifactBodyHTML(item) {
+  if (!item) return '<div class="art-empty">Nothing to show yet.</div>';
+
+  if (item.kind === 'table') {
+    const cols = Math.max(item.header.length, ...item.rows.map((r) => r.length), 1);
+    const head = Array.from({ length: cols }, (_, i) => `<th class="art-col">${colName(i)}</th>`).join('');
+    const label = Array.from({ length: cols }, (_, i) =>
+      `<th>${escapeHtml(item.header[i] ?? '')}</th>`).join('');
+    const body = item.rows.map((r, n) => `
+      <tr><td class="art-rownum">${n + 2}</td>${
+        Array.from({ length: cols }, (_, i) => `<td>${escapeHtml(r[i] ?? '')}</td>`).join('')
+      }</tr>`).join('');
+
+    return `
+      <div class="art-sheet">
+        <table>
+          <thead>
+            <tr><th class="art-rownum art-col"></th>${head}</tr>
+            <tr class="art-headrow"><td class="art-rownum">1</td>${label}</tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>`;
+  }
+
+  const lang = window.hljs?.getLanguage(item.lang) ? item.lang : '';
+  let body;
+  try {
+    body = lang ? hljs.highlight(item.code, { language: lang }).value : escapeHtml(item.code);
+  } catch {
+    body = escapeHtml(item.code);
+  }
+  const lines = item.code.split('\n');
+  const gutter = lines.map((_, i) => i + 1).join('\n');
+
+  return `
+    <div class="art-code">
+      <pre class="art-gutter" aria-hidden="true">${gutter}</pre>
+      <pre class="art-lines"><code class="hljs language-${escapeHtml(lang)}">${body}</code></pre>
+    </div>`;
+}
+
+function renderArtifact() {
+  const items = panelItems();
+  if (!items.length) {
+    el.artifactTabs.hidden = true;
+    el.artifactTabs.innerHTML = '';
+    $('#artifactTitle').textContent = ideOn() ? 'Editor' : 'Output';
+    $('#artifactSub').textContent = '';
+    $('#artifactSave').hidden = true;
+    $('#artifactDelete').hidden = true;
+    $('#artifactSaveAll').hidden = true;
+    $('#artifactMeta').textContent = '';
+    $('#artifactClose').hidden = ideOn();
+    $('#artifactCopy').hidden = true;
+    $('#artifactDownload').hidden = true;
+    $('#artifactLive').hidden = true;
+    renderBreadcrumbs(null);
+    updateStatusBar();
+    el.artifactBody.innerHTML = ideOn()
+      ? `<div class="art-empty">${ws.root
+          ? 'Pick a file in the explorer to open it here.'
+          : 'Open a folder in the explorer to start editing.'}</div>`
+      : '<div class="art-empty">Waiting for the first block&hellip;</div>';
+    updatePanelButton();
+    return;
+  }
+
+  const item = activeArtifact(items);
+  artifactState.key = item.key;
+  const index = items.indexOf(item);
+
+  if (item.kind === 'file') {
+    const file = wsOpenFile(item.path);
+    if (!file) { ws.openFiles = ws.openFiles.filter((f) => f.path !== item.path); return renderArtifact(); }
+
+    $('#artifactIcon').innerHTML = CODE_ICON;
+    $('#artifactTitle').textContent = file.name;
+    $('#artifactSub').textContent = `${file.path}${ws.readOnly ? ' · read-only' : ''}`;
+    $('#artifactDownload').title = `Download a copy of ${file.name}`;
+    $('#artifactClose').hidden = ideOn();
+    $('#artifactCopy').hidden = false;
+    $('#artifactDownload').hidden = false;
+    $('#artifactSave').hidden = ws.readOnly;
+    $('#artifactSave').classList.toggle('dirty', file.dirty);
+    $('#artifactDelete').hidden = true;
+    $('#artifactLive').hidden = true;
+    el.artifact.classList.remove('live');
+
+    el.artifactTabs.hidden = items.length < 2;
+    el.artifactTabs.innerHTML = items.length < 2 ? '' : tabsHTML(items, item);
+    renderBreadcrumbs(item);
+    el.artifactBody.innerHTML = editorBodyHTML(file);
+    updateStatusBar();
+    updateCursorStatus(el.artifactBody.querySelector('.edit-area'));
+    $('#artifactMeta').textContent =
+      `${file.text.split('\n').length} lines · ${file.dirty ? 'unsaved changes' : 'saved'}`;
+    $('#artifactSaveAll').hidden = true;
+    updatePanelButton();
+    return;
+  }
+
+  $('#artifactSave').hidden = true;
+  $('#artifactDelete').hidden = false;
+  const msg = artifactMessage(item);
+
+  $('#artifactIcon').innerHTML = item.kind === 'table' ? SHEET_ICON : CODE_ICON;
+  $('#artifactTitle').textContent = item.name;
+  $('#artifactDownload').title = item.kind === 'table'
+    ? `Download this sheet as .xlsx`
+    : `Download ${item.name}`;
+  $('#artifactSub').textContent = item.kind === 'table'
+    ? `${item.rows.length} row${item.rows.length === 1 ? '' : 's'} · ${item.header.length} columns`
+    : (item.lang || 'text');
+
+  el.artifactTabs.hidden = items.length < 2;
+  el.artifactTabs.innerHTML = items.length < 2 ? '' : tabsHTML(items, item);
+
+  renderBreadcrumbs(item);
+  el.artifactBody.innerHTML = artifactBodyHTML(item);
+  updateStatusBar();
+
+  $('#artifactClose').hidden = ideOn();
+  $('#artifactCopy').hidden = false;
+  $('#artifactDownload').hidden = false;
+  const streaming = state.streaming && msg.pending;
+  $('#artifactLive').hidden = !streaming;
+  el.artifact.classList.toggle('live', streaming);
+  if (streaming && item.kind === 'code') el.artifactBody.scrollTop = el.artifactBody.scrollHeight;
+
+  $('#artifactMeta').textContent = item.kind === 'table'
+    ? `${item.rows.length} rows · ${index + 1} of ${items.length} in this chat`
+    : `${item.code.split('\n').length} lines · ${index + 1} of ${items.length} in this chat`;
+
+  const own = msg ? artifactsFor(msg) : [item];
+  const anyTable = own.some((a) => a.kind === 'table');
+  const codeCount = own.filter((a) => a.kind === 'code').length;
+  const save = $('#artifactSaveAll');
+  save.hidden = own.length < 2 && !msg?.deliverable;
+  updatePanelButton();
+  // The header button saves what is on screen; this one saves the whole reply.
+  save.textContent = anyTable
+    ? 'Save all tables (.xlsx)'
+    : `Save ${codeCount} file${codeCount === 1 ? '' : 's'} (.zip)`;
+}
+
+/** Called on every streaming repaint: open on the first block, then follow it. */
+let lastArtifactPaint = 0;
+
+function artifactStream(msg, acc) {
+  if (!acc) return;
+  const text = String(acc);
+  const hasBlock = /^```/m.test(text) || /^\s*\|.*\|\s*$/m.test(text);
+  if (!hasBlock) return;
+
+  msg.content = text;   // so artifactsFor() sees the partial reply
+
+  if (el.artifact.hidden) {
+    if (artifactState.dismissed === msg.id) return;   // the user closed it for this reply
+    artifactCache.delete(msg.id);
+    const first = artifactsFor(msg)[0];
+    if (!first) return;
+    openArtifact(msg.id, first.idx);
+    lastArtifactPaint = performance.now();
+    return;
+  }
+  if (activeArtifact()?.msgId !== msg.id) return;
+
+  // Lexing and highlighting the whole reply is too costly to do on every frame.
+  const now = performance.now();
+  if (now - lastArtifactPaint < 200) return;
+  lastArtifactPaint = now;
+  artifactCache.delete(msg.id);
+  renderArtifact();
+}
+
+/** With "write files without asking" on, the reply lands on disk by itself. */
+async function maybeAutoApply() {
+  if (!state.settings.autoApply || !ws.root || ws.readOnly) return;
+  const files = pendingPatch();
+  if (!files.length) return;
+  await writePatchFiles(files);
+}
+
+/** Called once a reply is complete. */
+function artifactSettle(msg) {
+  artifactCache.delete(msg.id);
+  const items = artifactsFor(msg);
+
+  renderArtifactList();
+
+  if (!items.length) {
+    if (msg.deliverable === 'xlsx') {
+      toast('The reply had no table to put in a spreadsheet — try asking for the data as a table', 'err', 5000);
+    }
+    if (activeArtifact()?.msgId === msg.id) closeArtifact();
+    updatePanelButton();
+    return;
+  }
+
+  // A requested file wins: jump to the block that answers the request.
+  if (msg.deliverable === 'xlsx' || msg.deliverable === 'docx' || msg.deliverable === 'pptx') {
+    const sheet = items.find((a) => a.kind === 'table');
+    if (sheet) {
+      if (artifactState.dismissed !== msg.id) openArtifact(msg.id, sheet.idx);
+      toast('Spreadsheet ready — save it from the panel', 'ok', 4000);
+    }
+  } else if (msg.deliverable === 'zip' && artifactState.dismissed !== msg.id) {
+    openArtifact(msg.id, items[0].idx);
+  }
+
+  if (!el.artifact.hidden) renderArtifact();
+  updatePanelButton();
+}
+
+/* ---- Saving what is in the panel ---- */
+
+async function saveArtifact(item, title) {
+  if (item.kind === 'file') {
+    const file = wsOpenFile(item.path);
+    saveBlob(new Blob([file?.text ?? ''], { type: 'text/plain' }), file?.name || 'file.txt');
+    toast(`Saved a copy of ${file?.name}`, 'ok');
+    return;
+  }
+
+  if (item.kind === 'table') {
+    await loadScript(LIBS.xlsx);
+    const book = XLSX.utils.book_new();
+    const sheet = XLSX.utils.aoa_to_sheet([item.header, ...item.rows]);
+    XLSX.utils.book_append_sheet(book, sheet, safeName(item.name, 'Sheet').slice(0, 28) || 'Sheet');
+    const buf = XLSX.write(book, { bookType: 'xlsx', type: 'array' });
+    saveBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+             `${safeName(item.name || title, 'nexus')}.xlsx`);
+    toast('Saved as .xlsx', 'ok');
+    return;
+  }
+
+  const name = /\.[A-Za-z0-9]{1,8}$/.test(item.name)
+    ? item.name
+    : `${safeName(item.name, 'snippet')}.${EXT_BY_LANG[item.lang] || 'txt'}`;
+  saveBlob(new Blob([item.code], { type: 'text/plain' }), name);
+  toast(`Saved ${name}`, 'ok');
+}
+
+/* ---- Panel events ---- */
+
+el.artifactTabs.addEventListener('click', (e) => {
+  const close = e.target.closest('[data-close-file]');
+  if (close) { closeWorkspaceFile(close.dataset.closeFile); return; }
+
+  const tab = e.target.closest('[data-tab-key]');
+  if (!tab) return;
+  artifactState.key = tab.dataset.tabKey;
+  renderArtifact();
+});
+
+$('#panelBtn').addEventListener('click', () => {
+  if (!el.artifact.hidden) { closeArtifact(); return; }
+  const items = chatArtifacts();
+  if (!items.length) return;
+  const last = items[items.length - 1];
+  artifactState.dismissed = null;
+  openArtifact(last.msgId, Number(last.key.split(':')[1]));
+});
+
+$('#artifactDelete').addEventListener('click', () => {
+  const item = activeArtifact();
+  if (!item) return;
+  deleteArtifact(item.msgId, item.idx);
+});
+
+$('#artifactClose').addEventListener('click', closeArtifact);
+$('#artifactScrim').addEventListener('click', closeArtifact);
+
+$('#artifactCopy').addEventListener('click', async (e) => {
+  const item = activeArtifact();
+  if (!item) return;
+  const text = item.kind === 'table'
+    ? [item.header, ...item.rows].map((r) => r.join('\t')).join('\n')
+    : item.kind === 'file' ? (wsOpenFile(item.path)?.text ?? '')
+    : item.code;
+  const ok = await copyText(text);
+  toast(ok ? 'Copied' : 'Could not access the clipboard', ok ? 'ok' : 'err', 1600);
+  e.currentTarget.classList.add('done');
+  setTimeout(() => e.currentTarget.classList.remove('done'), 1200);
+});
+
+$('#artifactDownload').addEventListener('click', async () => {
+  const item = activeArtifact();
+  if (!item) return;
+  try {
+    el.statusLine.textContent = 'Building file…';
+    await saveArtifact(item, currentChat()?.title);
+  } catch (err) {
+    console.error('[Nexus] save failed', err);
+    toast(`Could not save: ${err.message}`, 'err', 5000);
+  } finally {
+    el.statusLine.textContent = '';
+  }
+});
+
+$('#artifactSaveAll').addEventListener('click', async () => {
+  const msg = artifactMessage();
+  if (!msg) return;
+  const items = artifactsFor(msg);   // the reply the panel is showing
+  const title = currentChat()?.title;
+  try {
+    el.statusLine.textContent = 'Building file…';
+    if (items.some((a) => a.kind === 'table')) {
+      await exportXlsx(visibleText(msg), title);
+      toast('Saved as .xlsx', 'ok');
+    } else {
+      await exportZip(visibleText(msg), title);
+    }
+  } catch (err) {
+    console.error('[Nexus] save failed', err);
+    toast(`Could not save: ${err.message}`, 'err', 5000);
+  } finally {
+    el.statusLine.textContent = '';
+  }
+});
+
+
+/** The Artifacts tab: everything produced across every conversation. */
+function renderArtifactList() {
+  const box = $('#artifactList');
+  if (!box) return;
+
+  const rows = [];
+  for (const chat of [...state.chats].sort((a, b) => b.updatedAt - a.updatedAt)) {
+    for (const m of chat.messages) {
+      if (m.role !== 'assistant') continue;
+      artifactsFor(m).forEach((item) => rows.push({ item, chat, msgId: m.id }));
+    }
+  }
+
+  const hidden = hiddenArtifactCount();
+  const restore = hidden
+    ? `<button class="art-restore" id="artifactRestore" type="button">Restore ${hidden} removed file${hidden === 1 ? '' : 's'}</button>`
+    : '';
+
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty-list">Code blocks and tables from the assistant collect here.</div>' + restore;
+    return;
+  }
+
+  box.innerHTML = rows.slice(0, 200).map(({ item, chat, msgId }) => `
+    <div class="art-row" data-chat="${chat.id}" data-msg="${msgId}" data-index="${item.idx}">
+      <button class="art-row-open" type="button">
+        <span class="art-row-ico">${item.kind === 'table' ? SHEET_ICON : CODE_ICON}</span>
+        <span class="art-row-text">
+          <b>${escapeHtml(item.name)}</b>
+          <em>${escapeHtml(chat.title)}</em>
+        </span>
+      </button>
+      <button class="icon-btn del art-row-del" type="button" title="Delete ${escapeHtml(item.name)}" aria-label="Delete">
+        <svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+      </button>
+    </div>`).join('') + restore;
+}
+
+$('#artifactList').addEventListener('click', (e) => {
+  if (e.target.closest('#artifactRestore')) { restoreArtifacts(); return; }
+
+  const row = e.target.closest('.art-row');
+  if (!row) return;
+
+  if (e.target.closest('.art-row-del')) {
+    deleteArtifact(row.dataset.msg, Number(row.dataset.index));
+    return;
+  }
+
+  if (row.dataset.chat !== state.currentId) setCurrent(row.dataset.chat);
+  artifactState.dismissed = null;
+  openArtifact(row.dataset.msg, Number(row.dataset.index));
+  if (innerWidth <= 860) el.app.classList.add('collapsed');
+});
+
+$('#agentsNavBtn').addEventListener('click', () => openSettings('agents'));
+
+/* Drag the panel edge, same feel as the sidebar. */
+(function initArtifactResizer() {
+  const grip = $('#artifactResizer');
+  const root = document.documentElement;
+  const clamp = (px) => Math.max(320, Math.min(720, px));
+  const setW = (px) => root.style.setProperty('--artifact-w', `${clamp(px)}px`);
+
+  let dragging = false;
+  grip.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    grip.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+  });
+  grip.addEventListener('pointermove', (e) => {
+    if (dragging) setW(innerWidth - e.clientX);
+  });
+  const stop = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try { grip.releasePointerCapture(e.pointerId); } catch {}
+    document.body.classList.remove('resizing');
+  };
+  grip.addEventListener('pointerup', stop);
+  grip.addEventListener('pointercancel', stop);
+
+  grip.addEventListener('keydown', (e) => {
+    const w = parseInt(getComputedStyle(root).getPropertyValue('--artifact-w'), 10) || 420;
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); setW(w + 24); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); setW(w - 24); }
+  });
+})();
 
 try {
   boot();
