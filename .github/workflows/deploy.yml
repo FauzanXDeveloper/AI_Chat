@@ -28,10 +28,12 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@v4
 
-      # enablement: true turns Pages on the first time this runs, so the
-      # repository settings do not have to be touched by hand.
+      # Tries to switch Pages on by itself. Repositories whose Actions token is
+      # read-only refuse that, and it is not fatal: the deploy below works as
+      # soon as Pages is on, however it got there.
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        continue-on-error: true
         with:
           enablement: true
 
