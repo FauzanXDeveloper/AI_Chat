@@ -22,8 +22,13 @@ on phones) only registers over `http://`, not `file://`.
 [.github/workflows/deploy.yml](.github/workflows/deploy.yml) publishes the repository to GitHub
 Pages on every push to `main`, and can be run by hand from the **Actions** tab. There is nothing to
 build: the job copies the repo (minus `.git`, `.github` and the colour helper), drops a `.nojekyll`
-marker in, and hands the folder to Pages. `actions/configure-pages` switches Pages on the first
-time it runs, so no settings need touching.
+marker in, and force-pushes the result to the `gh-pages` branch, which is what Pages serves.
+
+It publishes by pushing a branch rather than through the Pages deployment API on purpose. That API
+needs Pages set to *GitHub Actions* as its source, and a repository whose Actions token is
+read-only cannot set that itself — the deploy fails before the site is ever uploaded. Pushing a
+branch is an ordinary write, and creating `gh-pages` is what switched Pages on here in the first
+place.
 
 The site lands at **https://fauzanxdeveloper.github.io/AI_Chat/**. Every path in the app is
 relative, so serving it from a subfolder works as-is, and because Pages is `https` the browser

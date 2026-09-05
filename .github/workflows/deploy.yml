@@ -1,41 +1,32 @@
 name: Deploy to GitHub Pages
 
-# The app is static — no build, no bundler — so the job is really just
-# "copy the repo onto Pages", minus the files that are not part of the site.
+# The app is static — no build, no bundler — so this job is really just
+# "copy the repo onto the gh-pages branch", minus what is not part of the site.
+#
+# It publishes by pushing a branch rather than through the Pages deployment API,
+# because that route needs Pages set to "GitHub Actions" as its source, and a
+# repository whose Actions token is read-only cannot set that itself. Pages is
+# serving from the gh-pages branch, and pushing to it is an ordinary write.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
-# One deploy at a time; a newer push supersedes one still in flight.
+# One publish at a time; a newer push supersedes one still in flight.
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  publish:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
-
-      # Tries to switch Pages on by itself. Repositories whose Actions token is
-      # read-only refuse that, and it is not fatal: the deploy below works as
-      # soon as Pages is on, however it got there.
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-        continue-on-error: true
-        with:
-          enablement: true
 
       - name: Stage the site
         run: |
@@ -52,11 +43,24 @@ jobs:
           test -f _site/index.html
           ls -la _site
 
-      - name: Upload the artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
+      - name: Publish to gh-pages
+        run: |
+          cd _site
+          git init -q -b gh-pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish ${GITHUB_SHA::7}"
+          # The branch is generated output: one commit, replaced each time,
+          # so its history never accumulates copies of the whole app.
+          git push -f \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Where it landed
+        run: |
+          owner="${GITHUB_REPOSITORY%%/*}"
+          name="${GITHUB_REPOSITORY##*/}"
+          echo "Published to https://${owner,,}.github.io/${name}/" >> "$GITHUB_STEP_SUMMARY"
